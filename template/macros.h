@@ -48,4 +48,4 @@
 /** Get offset from virtual address
  * @param va virtual address
  */
-#define offset_from_va(va) (size_t)((unsigned long)source & 0xFFFFFFFFFFFF)
+#define offset_from_va(va) (size_t)((unsigned long)va & 0xFFFFFFFFFFFF)
