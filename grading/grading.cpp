@@ -273,7 +273,8 @@ int main(int argc, char** argv) {
         auto const expnbaccounts = 256 * nbworkers;
         auto const init_balance  = 100ul;
         auto const prob_long     = 0.5f;
-        auto const prob_alloc    = 0.01f;
+        // auto const prob_alloc    = 0.01f;
+        auto const prob_alloc = 0;
         auto const nbrepeats     = 7;
         auto const seed          = static_cast<Seed>(::std::stoul(argv[1]));
         auto const clk_res       = Chrono::get_resolution();
@@ -341,7 +342,7 @@ int main(int argc, char** argv) {
             } catch (::std::exception const& err) { // Special case: cannot unload library with running threads, so print error and quick-exit
                 ::std::cerr << "⎪ *** EXCEPTION ***" << ::std::endl;
                 ::std::cerr << "⎩ " << err.what() << ::std::endl;
-                ::std::quick_exit(2);
+                ::std::exit(2);
             }
         }
         return 0;
