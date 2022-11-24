@@ -1,7 +1,7 @@
 all: build run clean
 
 build:
-	gcc ../template/tm.c playground.c -I ../include -o playground -g
+	gcc ../353607/tm.c ../353607/versioned_lock.c playground.c -I ../include -o playground -g
 
 clean: 
 	rm playground

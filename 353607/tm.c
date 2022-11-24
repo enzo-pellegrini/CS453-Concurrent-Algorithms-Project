@@ -32,38 +32,43 @@
 #include <tm.h>
 
 #include "macros.h"
+#include "versioned_lock.h"
+
+#define VA_SIZE 65536
 
 /* *********************************** *
  * STRUCTURES FOR TRANSACTIONAL MEMORY *
  * *********************************** */
 
-//typedef struct versioned_lock_s {
-//  pthread_mutex_t write_lock;
-//  atomic_int version;
-//} versioned_lock_t;
-typedef atomic_int versioned_lock_t;
-
 typedef struct segment_s {
-  size_t size;   // Is this really needed? yes
-  int num_words; // might be redundant
-  versioned_lock_t *locks;
-  void *data;
-} * segment_t;
+    size_t size;   // Is this really needed? yes
+    int num_words; // might be redundant
+    versioned_lock_t *locks;
+    void *data;
+} *segment_t;
+
+typedef struct empty_spot_s {
+    struct empty_spot_s *next;
+    int index;
+} *empty_spot_t;
 
 typedef struct shared_s {
-  size_t align;
+    size_t align;
 
-  // virtual memory array
-  // TODO: more stuff needed for deallocation?
-  pthread_mutex_t
-      virtual_memory_lock; // Taken only to write (? can I do this? maybe yes)
-  segment_t ****virtual_memory; // 4 level list
-  int next_spot;
-  int allocated_spots;
+    pthread_rwlock_t cleanup_lock;
 
-  // global version lock
-  atomic_int global_version;
-} * tm_t;
+    // virtual memory array
+    pthread_mutex_t virtual_memory_lock; // Taken to write, enough if the va is big enough
+
+    empty_spot_t empty_spots;
+
+    // virtual address array, to get segment from virtual address
+    segment_t *va_arr;
+    int va_n;
+
+    // global version flag
+    atomic_int global_version;
+} *tm_t;
 
 /* ************************** *
  * STRUCTURES FOR TRANSACTION *
@@ -71,101 +76,126 @@ typedef struct shared_s {
 
 // typedef const void * rs_item_t;
 typedef struct rs_item_s {
-  const void *addr; // virtual address
-  const atomic_int *version;
+    versioned_lock_t *version;
 } rs_item_t;
 
 typedef struct ws_item_s {
-  void *addr;  // virtual address
-  void *value; // content written
-  void *raw_addr;
-  versioned_lock_t *versioned_lock;
+    void *addr;  // virtual address
+    void *value; // content written
+    void *raw_addr;
+    versioned_lock_t *versioned_lock;
 } ws_item_t;
 
 int ws_item_cmp(const void *a, const void *b) {
-  return ((ws_item_t *)a)->addr - ((ws_item_t *)b)->addr;
+    return ((ws_item_t *) a)->addr - ((ws_item_t *) b)->addr;
 }
 
 typedef struct tx_s {
-  int rv;
-  bool is_ro;
-  ws_item_t *ws;
-  int ws_sz;
-  int ws_n;
-  rs_item_t *rs;
-  int rs_sz;
-  int rs_n;
-} * transaction_t;
+    int rv;
+    bool is_ro;
+    ws_item_t *ws;
+    int ws_sz;
+    int ws_n;
+    rs_item_t *rs;
+    int rs_sz;
+    int rs_n;
+    int *to_free;
+    int to_free_sz;
+    int *allocated; // to free if allocating transaction fails
+    int allocated_sz;
+} *transaction_t;
 
-bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source,
-                         size_t size, void *target);
+bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source, size_t size, void *target);
 
 // Segment function signatures
 inline int allocate_segment(tm_t tm);
+
 inline int segment_init(segment_t *s, size_t size, size_t align);
+
 inline void segment_destroy(segment_t);
+
 inline segment_t segment_at(segment_t ****virtual_memory, int idx);
+
 inline segment_t *segment_at_p(segment_t ****virtual_memory, int idx);
 
-/** Create (i.e. allocate + init) a new shared memory region, with one first
- *non-free-able allocated segment of the requested size and alignment.
- * @param size  Size of the first shared segment of memory to allocate (in
- *bytes), must be a positive multiple of the alignment
- * @param align Alignment (in bytes, must be a power of 2) that the shared
- *memory region must support
+// Cleanup functions, do frees
+void segment_cleanup(segment_t segment) {
+    free(segment->data);
+    free(segment->locks);
+    free(segment);
+}
+
+void tm_cleanup(tm_t tm) {
+    for (int i = 0; i < tm->va_n; i++) {
+        if (tm->va_arr[i] != NULL)
+            segment_cleanup(tm->va_arr[i]);
+    }
+    while (tm->empty_spots != NULL) {
+        empty_spot_t tmp = tm->empty_spots;
+        tm->empty_spots = tm->empty_spots->next;
+        free(tmp);
+    }
+    free(tm->va_arr);
+    pthread_rwlock_destroy(&tm->cleanup_lock);
+    pthread_mutex_destroy(&tm->virtual_memory_lock);
+    free(tm);
+}
+
+void transaction_cleanup(transaction_t transaction) {
+    if (!transaction->is_ro) {
+        free(transaction->ws);
+        free(transaction->rs);
+        free(transaction->to_free);
+        free(transaction->allocated);
+    }
+    free(transaction);
+}
+
+/** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
+ * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
+ * @param align Alignment (in bytes, must be a power of 2) that the shared memory region must support
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
  **/
 shared_t tm_create(size_t size, size_t align) {
-  tm_t tm = malloc(sizeof(struct shared_s));
+    tm_t tm = malloc(sizeof(struct shared_s));
 
-  if (tm == NULL) {
-    return invalid_shared;
-  }
+    if (tm == NULL) {
+        return invalid_shared;
+    }
 
-  tm->align = align;
+    tm->align = align;
 
-  atomic_store(&tm->global_version, 0);
+    atomic_store(&tm->global_version, 0);
 
-  unlikely(pthread_mutex_init(&tm->virtual_memory_lock, NULL));
-  tm->virtual_memory = calloc(16, sizeof(void *));
-  tm->virtual_memory[0] = calloc(16, sizeof(void *));
-  tm->virtual_memory[0][0] = calloc(16, sizeof(void *));
-  tm->virtual_memory[0][0][0] =
-      malloc(16 * sizeof(segment_t)); // Does not need to be null initialized
-  tm->next_spot = 1;
-  tm->allocated_spots = 16;
+    unlikely(pthread_rwlock_init(&tm->cleanup_lock, NULL));
+    unlikely(pthread_mutex_init(&tm->virtual_memory_lock, NULL));
+    tm->va_arr = malloc(VA_SIZE * sizeof(segment_t));
+    tm->va_n = 0;
+    tm->empty_spots = NULL;
 
-  int allocation_err =
-      segment_init(&tm->virtual_memory[0][0][0][0], size, align);
-  if (allocation_err != 0) {
-    free(tm->virtual_memory[0][0][0]);
-    free(tm->virtual_memory[0][0]);
-    free(tm->virtual_memory[0]);
-    free(tm->virtual_memory);
-    free(tm);
+    int allocation_err = segment_init(&tm->va_arr[0], size, align);
+    if (allocation_err != 0) {
+        tm_cleanup(tm);
+        return invalid_shared;
+    }
 
-    return invalid_shared;
-  }
+    tm->va_n++;
 
-  tm->next_spot++;
-
-  return tm;
+    return tm;
 }
+
 
 /** Destroy (i.e. clean-up + free) a given shared memory region.
  * @param shared Shared memory region to destroy, with no running transaction
  **/
 void tm_destroy(shared_t shared) {
-  // TODO: implement freeing
-  tm_t tm = (tm_t)shared;
+    // TODO: implement freeing
+    tm_t tm = (tm_t) shared;
 
-  for (int i = 0; i < tm->next_spot; i++) {
-    segment_destroy(segment_at(tm->virtual_memory, i));
-  }
+    tm_cleanup(tm);
 }
 
-/** [thread-safe] Return the start address of the first allocated segment in the
- *shared memory region.
+/** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
  * @param shared Shared memory region to query
  * @return Start address of the first allocated segment
  **/
@@ -178,8 +208,8 @@ of
  * @return First allocated segment size
  **/
 size_t tm_size(shared_t unused(shared)) {
-  tm_t tm = (tm_t)shared;
-  return tm->virtual_memory[0][0][0][0]->size;
+    tm_t tm = (tm_t) shared;
+    return tm->va_arr[0]->size;
 }
 
 /** [thread-safe] Return the alignment (in bytes) of the memory accesses on
@@ -189,8 +219,8 @@ the
  * @return Alignment used globally
  **/
 size_t tm_align(shared_t shared) {
-  tm_t tm = shared;
-  return tm->align;
+    tm_t tm = shared;
+    return tm->align;
 }
 
 /** [thread-safe] Begin a new transaction on the given shared memory region.
@@ -199,37 +229,48 @@ size_t tm_align(shared_t shared) {
  * @return Opaque transaction ID, 'invalid_tx' on failure
  **/
 tx_t tm_begin(shared_t unused(shared), bool is_ro) {
-  tm_t tm = (tm_t)shared;
-  transaction_t t = malloc(sizeof(struct tx_s));
-  if (t == NULL) {
-    return invalid_tx;
-  }
-  t->rv = atomic_load(&tm->global_version);
-  t->is_ro = is_ro;
-  if (is_ro) {
-    return (tx_t)t; // I didn't actually need as much space as I allocated
-  }
+    tm_t tm = (tm_t) shared;
 
-  // Allocate read-set
-  t->rs_sz = 8;
-  t->rs_n = 0;
-  t->rs = malloc(t->rs_sz * sizeof(rs_item_t));
-  if (t->rs == NULL) {
-    free(t);
-    return invalid_tx;
-  }
+//    pthread_rwlock_rdlock(&tm->cleanup_lock);
 
-  // Allocate write-set
-  t->ws_sz = 8;
-  t->ws_n = 0;
-  t->ws = malloc(t->ws_sz * sizeof(struct ws_item_s));
-  if (t->ws == NULL) {
-    free(t->rs);
-    free(t);
-    return invalid_tx;
-  }
+    transaction_t t = malloc(sizeof(struct tx_s));
+    if (t == NULL) {
+        return invalid_tx;
+    }
+    t->rv = atomic_load(&tm->global_version);
+    t->is_ro = is_ro;
+    if (is_ro) {
+        return (tx_t) t; // I didn't actually need as much space as I allocated
+    }
 
-  return (tx_t)t;
+    // Allocate read-set
+    t->rs_sz = 8;
+    t->rs_n = 0;
+    t->rs = malloc(t->rs_sz * sizeof(rs_item_t));
+    if (t->rs == NULL) {
+        free(t);
+        return invalid_tx;
+    }
+
+    // Allocate write-set
+    t->ws_sz = 8;
+    t->ws_n = 0;
+    t->ws = malloc(t->ws_sz * sizeof(struct ws_item_s));
+    if (t->ws == NULL) {
+        free(t->rs);
+        free(t);
+        return invalid_tx;
+    }
+
+    // Init to-free array
+    t->to_free_sz = 0;
+    t->to_free = NULL;
+
+    // Init allocated array
+    t->allocated_sz = 0;
+    t->allocated = NULL;
+
+    return (tx_t) t;
 }
 
 /** [thread-safe] End the given transaction.
@@ -238,63 +279,64 @@ tx_t tm_begin(shared_t unused(shared), bool is_ro) {
  * @return Whether the whole transaction committed
  **/
 bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
-  tm_t tm = (tm_t)shared;
-  transaction_t t = (transaction_t)tx;
+    tm_t tm = (tm_t) shared;
+    transaction_t t = (transaction_t) tx;
 
-  if (t->is_ro) {
-    free(t);
+    if (t->is_ro) {
+        free(t);
+        return true;
+    }
+
+    // flag and validate each item in the write-set
+    for (int i = 0; i < t->ws_n; i++) {
+        ws_item_t item = t->ws[i];
+        // take flag and check version number
+        bool success_locking = vl_try_lock(item.versioned_lock, t->rv);
+        if (!success_locking) {
+            // abort
+            for (int j = 0; j < i; j++) {
+                vl_unlock(t->ws[j].versioned_lock);
+            }
+
+            transaction_cleanup(t);
+
+            return false;
+        }
+    }
+
+    // fetch and increment global version
+    int wv = atomic_fetch_add(&tm->global_version, 1);
+
+    // check version number and if it is locked for each item in read-set,
+    // otherwise flag it
+    for (int i = 0; i < t->rs_n; i++) {
+        int version_read = vl_read_version(t->rs[i].version);
+        if (version_read == -1 || version_read > t->rv) {
+            // abort, unlock all locks
+            for (int j = 0; j < t->ws_n; i++) {
+                vl_unlock(t->ws[j].versioned_lock);
+            }
+
+            transaction_cleanup(t);
+
+            return false;
+        }
+    }
+
+    // sort the write-set
+    qsort(t->ws, t->ws_n, sizeof(ws_item_t), ws_item_cmp);
+
+    // for each item in write set, write to memory, set version number to wv and
+    // unlock
+    for (int i = 0; i < t->ws_n; i++) {
+        ws_item_t item = t->ws[i];
+        memcpy(item.raw_addr, item.value, tm->align);
+        vl_unlock_update(item.versioned_lock, wv);
+    }
+
+    transaction_cleanup(t);
+
     return true;
-  }
-
-  // sort the write-set
-  qsort(t->ws, t->ws_n, sizeof(struct ws_item_s), ws_item_cmp);
-
-  // lock and validate each item in the write-set
-  for (int i = 0; i < t->ws_n; i++) {
-    ws_item_t item = t->ws[i];
-    // take lock and check version number
-    pthread_mutex_lock(&item.versioned_lock->write_lock);
-    if (item.versioned_lock->version > t->rv) {
-      // abort
-      for (int j = 0; j <= i; j++) {
-        pthread_mutex_unlock(&t->ws[i].versioned_lock->write_lock);
-      }
-      free(t->ws);
-      free(t->rs);
-      free(t);
-      return false;
-    }
-    atomic_fetch_add(&item.versioned_lock->version, 1); // set the locked bit
-  }
-
-  int wv = atomic_fetch_add(&tm->global_version, 1);
-
-  // check version number and if it is locked for each item in read-set
-  for (int i = 0; i < t->rs_n; i++) {
-    int version_read = atomic_load(t->rs[i].version);
-    if (version_read & 0x1 || (version_read >> 1) > t->rv) {
-      // unlock all locks
-      for (int j = 0; j < t->ws_n; i++) {
-        pthread_mutex_unlock(&t->ws[j].versioned_lock->write_lock);
-        atomic_fetch_sub(&t->ws[j].versioned_lock->version, 1);
-      }
-      // TODO: gc
-      return false;
-    }
-  }
-
-  // for each item in write set, write to memory, set version number to wv and
-  // unlock
-  for (int i = 0; i < t->ws_n; i++) {
-    ws_item_t item = t->ws[i];
-    memcpy(item.raw_addr, item.value, tm->align);
-    atomic_store(&item.versioned_lock->version, wv);
-    pthread_mutex_unlock(&item.versioned_lock->write_lock);
-  }
-
-  // TODO: gc
-
-  return true;
 }
 
 /** [thread-safe] Read operation in the given transaction, source in the
@@ -308,97 +350,104 @@ shared
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
  **/
-bool tm_read(shared_t unused(shared), tx_t unused(tx), void const *source,
-             size_t size, void *target) {
-  tm_t tm = shared;
-  transaction_t transaction = (void *)tx;
-  if (transaction->is_ro) {
-    return ro_transaction_read(tm, transaction, source, size, target);
-  }
+bool tm_read(shared_t unused(shared), tx_t unused(tx), void const *source, size_t size, void *target) {
+    tm_t tm = shared;
+    transaction_t transaction = (void *) tx;
 
-  int align = tm->align;
-  segment_t s = segment_at(tm->virtual_memory, index_from_va(source));
-
-  for (const void *curr = source;
-       (unsigned long)curr - (unsigned long)source <= size; curr += align) {
-    bool found = false;
-
-    // Check if word is present in the write set
-    for (int i = 0; i < transaction->ws_n; i++) {
-      if (transaction->ws[i].addr == curr) {
-        memcpy(target, transaction->ws[i].value, align);
-        found = true;
-        break;
-      }
-    }
-    if (found) {
-      continue;
+    if (transaction->is_ro) {
+        return ro_transaction_read(tm, transaction, source, size, target);
     }
 
-    bool found_in_readset = false;
-    // Check if word is present in the read set
-    for (int i = 0; i < transaction->rs_n; i++) {
-      if (transaction->rs[i].addr == curr) {
-        found_in_readset = true;
-        break;
-      }
+    int align = tm->align;
+    segment_t s = tm->va_arr[index_from_va(source)];
+
+    int num_words = size / align;
+    int offset = offset_from_va(source);
+    int start_word = offset / align;
+
+    for (int i = 0; i < num_words; i++) {
+        bool found = false;
+
+        // Check if word is present in the write set
+        for (int j = 0; j < transaction->ws_n; j++) {
+            if (transaction->ws[j].addr == source + i * align) {
+                memcpy(target, transaction->ws[j].value, align);
+                found = true;
+                break;
+            }
+        }
+        if (found) {
+            continue;
+        }
+
+        // Read word the same way as for read-only transactions
+        versioned_lock_t *version = &s->locks[start_word + i];
+
+        // Check if word is present in the read set
+        bool found_in_readset = false;
+        for (int j = 0; j < transaction->rs_n; j++) {
+            if (transaction->rs[j].version == version) {
+                found_in_readset = true;
+                break;
+            }
+        }
+
+        int version_read = vl_read_version(version);
+        if (version_read == -1 || version_read > transaction->rv) {
+            // abort
+            transaction_cleanup(transaction);
+
+//            printf("aborting transaction because of version number\n");
+            return false;
+        }
+        memcpy(target + i * align, s->data + (start_word + i) * align, align);
+        if (vl_read_version(version) != version_read) {
+            // version number changed, abort
+            transaction_cleanup(transaction);
+            return false;
+        }
+
+        if (found_in_readset) {
+            return true;
+        }
+        // Add word to read set
+        if (transaction->rs_n == transaction->rs_sz) {
+            transaction->rs_sz *= 2;
+            transaction->rs = realloc(transaction->rs, transaction->rs_sz * sizeof(rs_item_t));
+            if (transaction->rs == NULL) {
+                transaction_cleanup(transaction);
+                return false;
+            }
+        }
+        transaction->rs[transaction->rs_n++] = (rs_item_t) {version};
     }
 
-    // Read word the same way as for read-only transactions
-    atomic_int *version = &s->locks[offset_from_va(curr) / align].version;
-    int version_read = atomic_load(version);
-    memcpy(target + (curr - source), s->data + offset_from_va(curr), align);
-    if (atomic_load(version) != version_read) {
-      // version number changed, abort
-      // TODO: gc
-      return false;
-    }
-
-    if (found_in_readset) {
-      return true;
-    }
-    // Add word to read set
-    if (transaction->rs_n == transaction->rs_sz) {
-      transaction->rs_sz *= 2;
-      transaction->rs =
-          realloc(transaction->rs, transaction->rs_sz * sizeof(rs_item_t));
-      if (transaction->rs == NULL) {
-        // TODO: gc
-        return false;
-      }
-    }
-    transaction->rs[transaction->rs_n++] = (rs_item_t){curr, version};
-  }
-
-  return true;
+    return true;
 }
 
-bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source,
-                         size_t size, void *target) {
-  segment_t s = segment_at(tm->virtual_memory, index_from_va(source));
-  size_t offset = offset_from_va(source);
-  int start_idx = offset / tm->align;
-  int num_words = size / tm->align;
-  int word_locks[num_words];
+bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source, size_t size, void *target) {
+    segment_t s = tm->va_arr[index_from_va(source)];
+    size_t offset = offset_from_va(source);
+    int start_idx = offset / tm->align;
+    int num_words = size / tm->align;
 
-  // CHECK THE VERSIONS BEFORE READING
-  for (int i = 0; i < num_words; i++) {
-    word_locks[i] = atomic_load(&s->locks[start_idx + i].version);
-    if (word_locks[i] & 0b1 || word_locks[i] >> 1 > transaction->rv)
-      // word locked, abort
-      return false;
-  }
-  // READ
-  memcpy(target, s->data + offset, size);
+    for (int i = 0; i < num_words; i++) {
+        int prevVersion = vl_read_version(&s->locks[start_idx + i]);
+        if (prevVersion == -1 || prevVersion > transaction->rv) {
+            // word locked, abort
+            transaction_cleanup(transaction);
+            return false;
+        }
+        memcpy(target + i * tm->align, s->data + offset + i * tm->align, tm->align);
+        if (prevVersion != vl_read_version(&s->locks[start_idx + i])) {
+            // version number changed, abort
+            transaction_cleanup(transaction);
+//            printf("aborting transaction because of version number\n");
+            return false;
+        }
+    }
 
-  // RECHECK VERSIONS
-  for (int i = 0; i < num_words; i++) {
-    if (word_locks[i] != atomic_load(&s->locks[start_idx + i].version))
-      // version number changed, abort
-      return false;
-  }
-
-  return true;
+    return true;
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a
@@ -412,90 +461,114 @@ private
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
  **/
-bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size,
-              void *target) {
-  tm_t tm = shared;
-  transaction_t transaction = (transaction_t)tx;
-  if (transaction->is_ro) {
-    return false; // invalid operation
-  }
+bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
+    tm_t tm = shared;
+    transaction_t transaction = (transaction_t) tx;
 
-  segment_t s = segment_at(tm->virtual_memory, index_from_va(target));
-  int idx_start = offset_from_va(target) / tm->align;
-  int num_words = size / tm->align;
+//    printf("tm_write: %p %p %d", source, target, size);
 
-  for (int i = 0; i < num_words; i++) {
-    //    int version = atomic_load(&s->locks[idx_start + i].version);
-    versioned_lock_t *version_lock = &s->locks[idx_start + i];
-    int version_read = atomic_load(&version_lock->version);
-    if (version_read & 0x1 || version_read >> 1 > transaction->rv) {
-      // word modified or soon to be modified
-      return false;
+    unlikely(transaction->is_ro);
+
+    segment_t s = tm->va_arr[index_from_va(target)];
+    int idx_start = offset_from_va(target) / tm->align;
+    int num_words = size / tm->align;
+
+    for (int i = 0; i < num_words; i++) {
+        //    int version = atomic_load(&s->locks[idx_start + i].version);
+        versioned_lock_t *version_lock = &s->locks[idx_start + i];
+        int version_read = vl_read_version(version_lock);
+        if (version_read == -1 || version_read > transaction->rv) {
+            // word modified or soon to be modified
+            transaction_cleanup(transaction);
+            return false;
+        }
+
+        // Check if word already in write set
+        bool found = false;
+        for (int j = 0; j < transaction->ws_n; j++) {
+            if (transaction->ws[j].addr == target + i * tm->align) {
+                found = true;
+                memcpy(transaction->ws[j].value, source + i * tm->align, tm->align);
+                break;
+            }
+        }
+
+        if (found) {
+            continue;
+        }
+
+        // Add word to write set
+        if (transaction->ws_n == transaction->ws_sz) {
+            transaction->ws_sz *= 2;
+            transaction->ws = realloc(transaction->ws, transaction->ws_sz * sizeof(ws_item_t));
+            if (transaction->ws == NULL) {
+                transaction_cleanup(transaction);
+//                printf("aborting transaction because of malloc\n");
+                return false;
+            }
+        }
+        void *tmp = malloc(tm->align);
+        if (tmp == NULL) {
+            transaction_cleanup(transaction);
+            return false;
+        }
+        memcpy(tmp, source + i * tm->align, tm->align);
+        void *raw_address = s->data + (idx_start + i) * tm->align;
+        transaction->ws[transaction->ws_n++] = (ws_item_t) {target + i * tm->align, tmp, raw_address, version_lock};
     }
 
-    // Check if word already in write set
-    bool found = false;
-    for (int j = 0; j < transaction->ws_n; j++) {
-      if (transaction->ws[j].addr == target + i * tm->align) {
-        found = true;
-        memcpy(transaction->ws[j].value, source + i * tm->align, tm->align);
-        break;
-      }
-    }
-
-    if (found) {
-      continue;
-    }
-
-    // Add word to write set
-    if (transaction->ws_n == transaction->ws_sz) {
-      transaction->ws_sz *= 2;
-      transaction->ws =
-          realloc(transaction->ws, transaction->ws_sz * sizeof(ws_item_t));
-      if (transaction->ws == NULL) {
-        return false;
-      }
-    }
-    void *tmp = malloc(tm->align);
-    if (tmp == NULL) {
-      return false;
-    }
-    memcpy(tmp, source + i * tm->align, tm->align);
-    void *raw_address = s->data + (idx_start + i) * tm->align;
-    transaction->ws[transaction->ws_n++] =
-        (ws_item_t){target, tmp, raw_address, version_lock};
-  }
-
-  return true;
+    return true;
 }
 
 /** [thread-safe] Memory allocation in the given transaction.
  * @param shared Shared memory region associated with the transaction
  * @param tx     Transaction to use
- * @param size   Allocation requested size (in bytes), must be a positive
- *multiple of the alignment
- * @param target Pointer in private memory receiving the address of the first
- *byte of the newly allocated, aligned segment
+ * @param size   Allocation requested size (in bytes), must be a positive multiple of the alignment
+ * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not
  *(abort_alloc)
  **/
-alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t unused(size),
-                 void **unused(target)) {
-  // TODO: Keep track of allocated memory in the transaction and free it if
-  // transaction aborts
-  tm_t tm = shared;
+alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t unused(size), void **unused(target)) {
+    tm_t tm = shared;
+    transaction_t transaction = (transaction_t) tx;
 
-  int idx = allocate_segment(tm);
-  segment_t *seg_ptr = segment_at_p(tm->virtual_memory, idx); // gives nonsense
-  int mem_err = segment_init(seg_ptr, size, tm->align);
-  if (mem_err != 0) {
-    // TODO: some logic to put the spot back
-    return nomem_alloc;
-  }
+    printf("shithead wants to allocate %zu bytes", size);
 
-  *target = *seg_ptr;
+    pthread_mutex_lock(&tm->virtual_memory_lock);
 
-  return success_alloc;
+    int spot;
+    if (tm->empty_spots != NULL) {
+        spot = tm->empty_spots->index;
+        empty_spot_t tmp = tm->empty_spots;
+        tm->empty_spots = tm->empty_spots->next;
+        free(tmp);
+    } else {
+        spot = tm->va_n++;
+    }
+
+    segment_t *seg_ptr = &tm->va_arr[spot];
+    int mem_err = segment_init(seg_ptr, size, tm->align);
+    if (mem_err != 0) {
+        empty_spot_t tmp = malloc(sizeof(struct empty_spot_s));
+        unlikely(tmp == NULL);
+        tmp->index = spot;
+        tmp->next = tm->empty_spots;
+        tm->empty_spots = tmp;
+
+        pthread_mutex_unlock(&tm->virtual_memory_lock);
+
+        return nomem_alloc;
+    }
+
+    pthread_mutex_unlock(&tm->virtual_memory_lock);
+
+    *target = va_from_index(spot, 0);
+
+    // save allocated segment in transaction
+    transaction->allocated = realloc(transaction->allocated, (++transaction->allocated_sz) * sizeof(int));
+    transaction->allocated[transaction->allocated_sz] = spot;
+
+    return success_alloc;
 }
 
 /** [thread-safe] Memory freeing in the given transaction.
@@ -505,69 +578,41 @@ alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t unused(size),
  segment *to deallocate
  * @return Whether the whole transaction can continue
  **/
-bool tm_free(shared_t unused(shared), tx_t unused(tx), void *unused(target)) {
-  // TODO: tm_free(shared_t, tx_t, void*)
-  return true;
+bool tm_free(shared_t unused(shared), tx_t tx, void *target) {
+    transaction_t transaction = (transaction_t) tx;
+
+    transaction->to_free = realloc(transaction->to_free, (++transaction->to_free_sz) * sizeof(int));
+    transaction->to_free[transaction->to_free_sz] = index_from_va(target);
+
+    return true;
 }
 
 /* ************************************ *
  * IMPLEMENTATION OF INTERNAL FUNCTIONS *
  * ************************************ */
-/**
- * Give spot to put segment in virtual memory
- * @param tm transactional memory instance
- * @return idx in virtual memory
- */
-int allocate_segment(tm_t tm) {
-  pthread_mutex_lock(&tm->virtual_memory_lock);
-
-  int spot = tm->next_spot++;
-  if (spot >= tm->allocated_spots) {
-    // TODO: implement size increase of virtual memory array
-  }
-
-  pthread_mutex_unlock(&tm->virtual_memory_lock);
-
-  return spot;
-}
-
-segment_t segment_at(segment_t ****virtual_memory, int idx) {
-  return virtual_memory[(idx >> 12) & 0xf][(idx >> 8) & 0xf][(idx >> 4) & 0xf]
-                       [idx & 0xf];
-}
-
-segment_t *segment_at_p(segment_t ****virtual_memory, int idx) {
-  return &virtual_memory[(idx >> 12) & 0xf][(idx >> 8) & 0xf][(idx >> 4) & 0xf]
-                        [idx & 0xf];
-}
 
 int segment_init(segment_t *sp, size_t size, size_t align) {
-  *sp = malloc(sizeof(struct segment_s));
-  segment_t s = *sp;
-  int err = posix_memalign(&s->data, align, size);
-  if (err != 0) {
-    perror("Failed allocating data for segment:");
-    return err;
-  }
+    *sp = malloc(sizeof(struct segment_s));
+    segment_t s = *sp;
+    int err = posix_memalign(&s->data, align, size);
+    if (err != 0) {
+        perror("Failed allocating data for segment:");
+        return err;
+    }
 
-  // num_words might be a useless field for now, changes with stripes
-  s->num_words = size / align;
-  s->locks = calloc((size / align) * sizeof(versioned_lock_t), s->num_words);
-  if (s->locks == NULL) {
-    free(s->data);
+    // num_words might be a useless field for now, changes with stripes
+    s->num_words = size / align;
+    s->locks = calloc((size / align) * sizeof(versioned_lock_t), s->num_words);
+    if (s->locks == NULL) {
+        free(s->data);
 
-    return -1;
-  }
-  for (int i = 0; i < s->num_words; i++) {
-    unlikely(pthread_mutex_init(&s->locks[i].write_lock, NULL));
-  }
-  // TODO: to what version number should the versioned lock be initialized? (currently 0)
+        return -1;
+    }
+    for (int i = 0; i < s->num_words; i++) {
+        vl_init(&s->locks[i]);
+    }
 
-  s->size = size;
+    s->size = size;
 
-  return 0;
-}
-
-void segment_destroy(segment_t s) {
-  // TODO: implement function
+    return 0;
 }

@@ -27,7 +27,7 @@ commit the transaction.).
 We employ no synchronization primitive: Undefined Behavior (UB), bad bad.
 
 ### Good approach #1
-We take a big nice lock around the ++: correct.
+We take a big nice flag around the ++: correct.
 
 ### Bad approach #2
 We use an atomic variable but use 2 non atomic operations: not UB, but doesn't
@@ -42,7 +42,7 @@ We use an atomic variable and an atomic operation (fetch and add): correct.
 We employ no synchronization primitive: Undefined Behavior (UB), bad bad.
 
 ### Good approach #1
-We take a big nice lock around the test and set: correct.
+We take a big nice flag around the test and set: correct.
 
 ### Bad approach #2
 We use an atomic variable but use 2 non atomic operations: not UB, but doesn't
@@ -57,7 +57,7 @@ We use an atomic variable and an atomic operation (compare and swap): correct.
 We employ no synchronization primitive: Undefined Behavior (UB), bad bad.
 
 ### Okayish approach #1
-We take a big nice lock when when writting/reading and checking the bounds:
+We take a big nice flag when when writting/reading and checking the bounds:
 correct.
 
 ### Okayish approach #2

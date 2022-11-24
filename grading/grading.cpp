@@ -152,7 +152,7 @@ static auto measure(Workload& workload, unsigned int const nbthreads, unsigned i
     ::std::vector<::std::thread> threads(nbthreads);
     ::std::mutex  cerrlock;        // To avoid interleaving writes to 'cerr' in case more than one thread throw
     Sync          sync{nbthreads}; // "As-synchronized-as-possible" starts so that threads interfere "as-much-as-possible"
-    
+
     // We start nbthreads threads to measure performance.
     for (unsigned int i = 0; i < nbthreads; ++i) { // Start threads
         try {
@@ -268,13 +268,13 @@ int main(int argc, char** argv) {
                 res = 16;
             return static_cast<size_t>(res);
         }();
-        auto const nbtxperwrk    = 200000ul / nbworkers;
+        auto const nbtxperwrk    = 20000ul / nbworkers;
         auto const nbaccounts    = 32 * nbworkers;
         auto const expnbaccounts = 256 * nbworkers;
         auto const init_balance  = 100ul;
         auto const prob_long     = 0.5f;
-        // auto const prob_alloc    = 0.01f;
-        auto const prob_alloc = 0;
+        auto const prob_alloc    = 0.01f;
+//        auto const prob_alloc = 0;
         auto const nbrepeats     = 7;
         auto const seed          = static_cast<Seed>(::std::stoul(argv[1]));
         auto const clk_res       = Chrono::get_resolution();

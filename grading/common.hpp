@@ -203,7 +203,7 @@ public:
 **/
 class Latch final {
 private:
-    ::std::mutex            lock; // Local lock
+    ::std::mutex            lock; // Local flag
     ::std::condition_variable cv; // For waiting/waking up
     bool                  raised; // State of the latch
 public:
