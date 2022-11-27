@@ -34,3 +34,20 @@
     #define unused(variable)
     #warning This compiler has no support for GCC attributes
 #endif
+
+/** Get the index of segment
+ * @param vaddr virtual address
+ */
+#define index_from_va(va) ((((unsigned long)va >> 48) & 0xFFFF) - 1)
+
+/** Get virtual base address for segment
+ * @param idx index in virtual memory
+ * @param offset offset
+ */
+#define va_from_index(idx, offset)                                             \
+  (void *)(((unsigned long)(idx+1) << 48) + (unsigned long)offset)
+
+/** Get offset from virtual address
+ * @param va virtual address
+ */
+#define offset_from_va(va) (size_t)((unsigned long)va & 0xFFFFFFFFFFFF)
