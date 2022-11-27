@@ -17,6 +17,7 @@
 !*.cpp
 !*.cxx
 !*.c++
+!CMakeLists.txt
 
 !*.h
 !*.hh
