@@ -432,17 +432,11 @@ bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source,
     int num_words = size / tm->align;
 
     for (int i = 0; i < num_words; i++) {
-        int prevVersion = vl_read_version(&s->locks[start_idx + i]);
-        if (prevVersion == -1 || prevVersion > transaction->rv) {
+        memcpy(target + i * tm->align, s->data + offset + i * tm->align, tm->align);
+        int versionRead = vl_read_version(&s->locks[start_idx + i]);
+        if (versionRead == -1 || versionRead > transaction->rv) {
             // word locked, abort
             transaction_cleanup(transaction);
-            return false;
-        }
-        memcpy(target + i * tm->align, s->data + offset + i * tm->align, tm->align);
-        if (prevVersion != vl_read_version(&s->locks[start_idx + i])) {
-            // version number changed, abort
-            transaction_cleanup(transaction);
-//            printf("aborting transaction because of version number\n");
             return false;
         }
     }
