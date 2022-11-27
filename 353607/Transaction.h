@@ -15,10 +15,10 @@
 
 class Transaction {
 public:
-    Transaction(bool isRo);
+    explicit Transaction(bool isRo);
     void begin(SharedRegion* sr);
     bool commit(SharedRegion* sr);
-    bool read(SharedRegion* sr, const void* source, size_t size, void* target);
+    bool read(SharedRegion* sr, void* source, size_t size, void* target);
     bool write(SharedRegion* sr, const void* source, size_t size, void* target);
     Alloc alloc(SharedRegion* sr, size_t size, void** target);
     bool dealloc(SharedRegion* sr, void* target);
@@ -30,12 +30,11 @@ private:
 
     class WriteItem {
     public:
-        void* virtualAddress;
+        const void* virtualAddress;
         void* value;
-        void* rawAddr;
-        std::atomic_int* versionedLock;
 
-        WriteItem(void *virtualAddress, void *value, void *rawAddr, std::atomic_int *versionedLock);
+        WriteItem(const void *virtualAddress, void *value);
+        ~WriteItem();
 
         bool operator==(const WriteItem &rhs) const;
 
@@ -52,7 +51,8 @@ private:
         // TODO: generate hash thing
     };
 
-    std::map<void*, WriteItem> writeSet;
+    std::map<const void*, WriteItem*> writeSet;
+    std::vector<int> allocated; // vector of indexes of allocated segments
 };
 
 

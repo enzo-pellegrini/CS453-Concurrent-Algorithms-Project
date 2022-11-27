@@ -37,17 +37,17 @@ public:
     SharedRegion(size_t size, size_t align);
     ~SharedRegion();
     size_t getAlignment() const;
-    size_t getFirstSegmentSize();
+    size_t getFirstSegmentSize() const;
     static void* getFirstSegmentVa();
 
     std::atomic<int> globalVersion{};
     size_t alignment;
     std::shared_mutex cleanupLock;
     Segment** virtualMemoryArray;
-private:
     std::mutex virtualMemoryLock;
     int virtualMemoryLen;
     std::list<int> emptySpots;
+private:
 };
 
 

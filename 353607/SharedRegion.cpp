@@ -25,7 +25,7 @@ size_t SharedRegion::getAlignment() const {
     return alignment;
 }
 
-size_t SharedRegion::getFirstSegmentSize() {
+size_t SharedRegion::getFirstSegmentSize() const {
     return virtualMemoryArray[0]->size;
 }
 

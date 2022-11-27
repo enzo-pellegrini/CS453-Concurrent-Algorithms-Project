@@ -18,7 +18,7 @@ void     tm_destroy(shared_t sr) noexcept {
 
 void*    tm_start(shared_t sr) noexcept {
     SharedRegion* shared = static_cast<SharedRegion *>(sr);
-    return shared->getFirstSegmentVa();
+    return SharedRegion::getFirstSegmentVa();
 }
 
 size_t   tm_size(shared_t sr) noexcept {
@@ -49,7 +49,7 @@ bool     tm_end(shared_t sr, tx_t tx) noexcept {
 bool     tm_read(shared_t sr, tx_t tx, void const* source, size_t size, void* target) noexcept {
     SharedRegion* shared = static_cast<SharedRegion *>(sr);
     Transaction* transaction = reinterpret_cast<Transaction *>(tx);
-    if (transaction->read(shared, source, size, target)) {
+    if (transaction->read(shared, const_cast<void *>(source), size, target)) {
         return true;
     } else {
         delete transaction;
