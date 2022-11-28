@@ -22,7 +22,11 @@ struct Segment {
 #pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"
     Segment(size_t size, size_t align) : size{size} {
         int err = posix_memalign(&data, align, size);
-        locks = new std::atomic<int>[size/align];
+        int numLocks = size/align;
+        locks = new std::atomic<int>[numLocks];
+        for (int i=0; i<numLocks; i++) {
+            std::atomic_store(&locks[i], 0);
+        }
     }
 #pragma clang diagnostic pop
 

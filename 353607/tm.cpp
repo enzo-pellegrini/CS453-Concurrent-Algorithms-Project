@@ -68,6 +68,8 @@ bool     tm_write(shared_t sr, tx_t tx, void const* source, size_t size, void* t
     }
 }
 
+#pragma clang diagnostic push
+#pragma ide diagnostic ignored "ConstantConditionsOC"
 Alloc    tm_alloc(shared_t sr, tx_t tx, size_t size, void** target) noexcept {
     SharedRegion* shared = static_cast<SharedRegion *>(sr);
     Transaction* transaction = reinterpret_cast<Transaction *>(tx);
@@ -79,6 +81,7 @@ Alloc    tm_alloc(shared_t sr, tx_t tx, size_t size, void** target) noexcept {
         return out;
     }
 }
+#pragma clang diagnostic pop
 
 bool     tm_free(shared_t sr, tx_t tx, void* target) noexcept {
     SharedRegion* shared = static_cast<SharedRegion *>(sr);

@@ -8,7 +8,7 @@
 #include <tm.hpp>
 #include "SharedRegion.h"
 
-#include <set>
+#include <unordered_set>
 #include <map>
 #include <atomic>
 #include <ostream>
@@ -16,6 +16,7 @@
 class Transaction {
 public:
     explicit Transaction(bool isRo);
+    ~Transaction();
     void begin(SharedRegion* sr);
     bool commit(SharedRegion* sr);
     bool read(SharedRegion* sr, void* source, size_t size, void* target);
@@ -26,7 +27,7 @@ private:
     bool isRo;
     int rv;
 
-    std::set<std::atomic_int*> readSet;
+    std::unordered_set<std::atomic<int>*> readSet;
 
     class WriteItem {
     public:
@@ -35,20 +36,6 @@ private:
 
         WriteItem(const void *virtualAddress, void *value);
         ~WriteItem();
-
-        bool operator==(const WriteItem &rhs) const;
-
-        bool operator!=(const WriteItem &rhs) const;
-
-        bool operator<(const WriteItem &rhs) const;
-
-        bool operator>(const WriteItem &rhs) const;
-
-        bool operator<=(const WriteItem &rhs) const;
-
-        bool operator>=(const WriteItem &rhs) const;
-
-        // TODO: generate hash thing
     };
 
     std::map<const void*, WriteItem*> writeSet;
