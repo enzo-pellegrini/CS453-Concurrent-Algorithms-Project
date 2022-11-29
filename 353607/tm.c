@@ -14,7 +14,6 @@
  **/
 
 // Requested features
-#include <assert.h>
 #include <malloc/_malloc.h>
 #include <sys/_pthread/_pthread_mutex_t.h>
 #define _GNU_SOURCE
@@ -59,7 +58,7 @@ typedef struct mb_s {
     void* data;
     size_t pos;
     size_t size;
-} *mb_t;
+} mb_t;
 
 typedef struct shared_s {
     size_t align;
@@ -126,7 +125,7 @@ bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source,
 // Segment function signatures
 inline int allocate_segment(tm_t tm);
 
-inline int segment_init(segment_t *s, size_t size, size_t align, void* data);
+inline int segment_init(segment_t *s, size_t size, size_t align);
 
 inline segment_t segment_at(segment_t ****virtual_memory, int idx);
 
@@ -157,25 +156,16 @@ void tm_cleanup(tm_t tm) {
 
 // Massive block functions
 
-#define DEFAULT_BLOCK_SIZE 103600
-
-void mb_init(mb_t* mbp, size_t align) {
-    *mbp = malloc(sizeof(struct mb_s));
-    mb_t mb = *mbp;
-
-    mb->size = DEFAULT_BLOCK_SIZE;
-    mb->pos = 0;
-
-    int err = posix_memalign(&mb->data, align, DEFAULT_BLOCK_SIZE);
+void mb_init(mb_t* mb, size_t align) {
+    int err = posix_memalign(&mb->data, align, 1048576);
     if (err != 0) {
-        // printf("size: %d, align: %zu\n", DEFAULT_BLOCK_SIZE, align);
-        perror("I can't allocate mb");
         exit(1);
     }
-    memset(mb->data, 0, mb->size);
+    mb->size = 1048576;
+    mb->pos = 0;
 }
 
-void* mb_get_chunk(mb_t mb, size_t size) {
+void* mb_get_chunk(mb_t* mb, size_t size) {
     if (mb->size - mb->pos < size) {
         // There's not enough space left in this chunk
         return NULL;
@@ -219,9 +209,9 @@ shared_t tm_create(size_t size, size_t align) {
     unlikely(pthread_mutex_init(&tm->to_free_lock, NULL));
 
     // memory blocks
-    tm->memory_blocks_n = 1;
-    tm->memory_blocks = malloc(tm->memory_blocks_n * sizeof(mb_t));
-    mb_init(&tm->memory_blocks[0], align);
+    // tm->memory_blocks_n = 1;
+    // tm->memory_blocks = malloc(tm->memory_blocks_n * sizeof(struct mb_s));
+    // mb_init(&tm->memory_blocks[0], align);
 
     // virtual memory
     tm->va_arr = malloc(VA_SIZE * sizeof(segment_t));
@@ -233,8 +223,7 @@ shared_t tm_create(size_t size, size_t align) {
     tm->to_free_sz = 128;
     tm->to_free = malloc(tm->to_free_sz*sizeof(int));
 
-    void* first_seg_data = mb_get_chunk(tm->memory_blocks[0], size);
-    int allocation_err = segment_init(&tm->va_arr[0], size, align, first_seg_data);
+    int allocation_err = segment_init(&tm->va_arr[0], size, align);
     if (allocation_err != 0) {
         tm_cleanup(tm);
         return invalid_shared;
@@ -300,7 +289,6 @@ tx_t tm_begin(shared_t unused(shared), bool is_ro) {
     }
     t->rv = atomic_load(&tm->global_version);
     t->is_ro = is_ro;
-    // printf("Started transaction with rv: %d\n", t->rv);
     if (is_ro) {
         return (tx_t) t; // I didn't actually need as much space as I allocated
     }
@@ -453,8 +441,6 @@ bool tm_read(shared_t unused(shared), tx_t unused(tx), void const *source, size_
     int align = tm->align;
     segment_t s = tm->va_arr[index_from_va(source)];
 
-    assert(s!=NULL);
-
     int num_words = size / align;
     int offset = offset_from_va(source);
     int start_word = offset / align;
@@ -530,8 +516,6 @@ bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source,
         int versionRead = vl_read_version(&s->locks[start_idx + i]);
         if (versionRead == -1 || versionRead > transaction->rv) {
             // word locked, abort
-            // printf("ro_read failing, va: %p, read %d\n", source, versionRead);
-
             transaction_cleanup(tm, transaction, true);
             return false;
         }
@@ -634,7 +618,7 @@ alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t unused(size), void **u
 
     pthread_mutex_lock(&tm->virtual_memory_lock);
 
-    int spot;
+    int spot = tm->va_n++;
     if (tm->empty_spots != NULL) {
         spot = tm->empty_spots->index;
         empty_spot_t tmp = tm->empty_spots;
@@ -644,23 +628,11 @@ alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t unused(size), void **u
         spot = tm->va_n++;
     }
 
-    // // TODO: Handle (unlikely) size > DEFAULT_BLOCK_SIZE
-    void* seg_data;
-    for (int i_mb = 0; seg_data == NULL; i_mb++) {
-        if (i_mb >= tm->memory_blocks_n) {
-            tm->memory_blocks_n++;
-            mb_init(&tm->memory_blocks[i_mb], tm->align);
-        }
-
-        seg_data = mb_get_chunk(tm->memory_blocks[i_mb], size);
-    }
-
     pthread_mutex_unlock(&tm->virtual_memory_lock);
 
     segment_t *seg_ptr = &tm->va_arr[spot];
-    int mem_err = segment_init(seg_ptr, size, tm->align, seg_data);
+    int mem_err = segment_init(seg_ptr, size, tm->align);
     if (mem_err != 0) {
-        printf("Chec\n");
         empty_spot_t tmp = malloc(sizeof(struct empty_spot_s));
         unlikely(tmp == NULL);
         tmp->index = spot;
@@ -674,9 +646,9 @@ alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t unused(size), void **u
     *target = va_from_index(spot, 0);
     // printf("Allocated semgment %d, va: %p\n", spot, *target);
 
-    // // save allocated segment in transaction
-    // transaction->allocated = realloc(transaction->allocated, (++transaction->allocated_sz) * sizeof(int));
-    // transaction->allocated[transaction->allocated_sz] = spot;
+    // save allocated segment in transaction
+    transaction->allocated = realloc(transaction->allocated, (++transaction->allocated_sz) * sizeof(int));
+    transaction->allocated[transaction->allocated_sz] = spot;
 
     return success_alloc;
 }
@@ -704,17 +676,24 @@ bool tm_free(shared_t unused(shared), tx_t tx, void *target) {
  * IMPLEMENTATION OF INTERNAL FUNCTIONS *
  * ************************************ */
 
-int segment_init(segment_t *sp, size_t size, size_t align, void* data) {
+int segment_init(segment_t *sp, size_t size, size_t align) {
     *sp = malloc(sizeof(struct segment_s));
     segment_t s = *sp;
-    s->data = data;
+    int err = posix_memalign(&s->data, align, size);
+    if (err != 0) {
+        perror("Failed allocating data for segment:");
+        return err;
+    }
 
-    // printf("allocated segment of size: %zu\n", size);
+    printf("allocated segment of size: %d\n", size);
+
+    // initialize with zeros
+    memset(s->data, 0, size);
 
     s->num_words = size / align;
     s->locks = malloc(s->num_words * sizeof(versioned_lock_t));
     if (s->locks == NULL) {
-        // free(s->data);
+        free(s->data);
 
         return -1;
     }
