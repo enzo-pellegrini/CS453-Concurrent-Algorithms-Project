@@ -8,4 +8,4 @@ clean:
 run:
 	./playground
 debug:
-	lldb -S ./lldb_start.txt
+	lldb playground
