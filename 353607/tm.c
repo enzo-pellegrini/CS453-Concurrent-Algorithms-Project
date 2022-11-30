@@ -35,6 +35,9 @@
 #include "macros.h"
 #include "versioned_lock.h"
 
+#include "hashset.h"
+#include "hashset_itr.h"
+
 #define VA_SIZE 65536
 #define VEC_INITIAL 8
 #define RESIZE_FACTOR 1.2
@@ -101,9 +104,7 @@ typedef struct tx_s {
     ws_item_t *ws;
     int ws_sz;
     int ws_n;
-    rs_item_t *rs;
-    int rs_sz;
-    int rs_n;
+    hashset_t rs;
     int *to_free;
     int to_free_sz;
 } * transaction_t;
@@ -218,9 +219,7 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     }
 
     // Allocate read-set
-    t->rs_sz = VEC_INITIAL;
-    t->rs_n = 0;
-    t->rs = malloc(t->rs_sz * sizeof(rs_item_t));
+    t->rs = hashset_create();
     if (t->rs == NULL) {
         free(t);
         return invalid_tx;
@@ -283,10 +282,10 @@ bool tm_end(shared_t shared, tx_t tx) {
 
     if (t->rv + 1 != wv) {
         // check version number and if it is locked for each item in read-set,
-        for (int i = 0; i < t->rs_n; i++) {
-            if (t->rs[i] == NULL)
-                continue;
-            int version_read = vl_read_version(t->rs[i]);
+        for (hashset_itr_t itr = hashset_iterator(t->rs); hashset_iterator_has_next(itr); hashset_iterator_next(itr)) {
+            versioned_lock_t* item = (versioned_lock_t*)hashset_iterator_value(itr);
+            if ((size_t)item == 0x1 || (size_t)item == 0x0) continue;
+            int version_read = vl_read_version(item);
             if (version_read == -1 || version_read > t->rv) {
                 // abort, unlock all locks
                 for (int j = 0; j < t->ws_n; j++) {
@@ -381,15 +380,6 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
 
         versioned_lock_t *version = &s->locks[start_word + i];
 
-        // Check if word is present in the read set
-        bool found_in_readset = false;
-        for (int j = 0; j < transaction->rs_n; j++) {
-            if (transaction->rs[j] == version) {
-                found_in_readset = true;
-                break;
-            }
-        }
-
         int version_read = vl_read_version(version);
         if (version_read == -1 || version_read > transaction->rv) {
             // abort
@@ -405,19 +395,8 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
             return false;
         }
 
-        if (found_in_readset) {
-            return true;
-        }
         // Add word to read set
-        if (transaction->rs_n == transaction->rs_sz) {
-            transaction->rs_sz *= RESIZE_FACTOR;
-            transaction->rs = realloc(transaction->rs, transaction->rs_sz * sizeof(rs_item_t));
-            if (transaction->rs == NULL) {
-                transaction_cleanup(tm, transaction, true);
-                return false;
-            }
-        }
-        transaction->rs[transaction->rs_n++] = (rs_item_t){version};
+        hashset_add(transaction->rs, version);
     }
 
     return true;
@@ -507,12 +486,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
         transaction->ws[transaction->ws_n++] = (ws_item_t){target + i * tm->align, tmp, raw_address, version_lock};
 
         // remove word from read-set
-        for (int i = 0; i < transaction->rs_n; i++) {
-            if (transaction->rs[i] == version_lock) {
-                transaction->rs[i] = NULL;
-                break;
-            }
-        }
+        hashset_remove(transaction->rs, version_lock);
     }
 
     return true;
@@ -659,7 +633,7 @@ void transaction_cleanup(tm_t tm, transaction_t t, bool failed) {
             free(t->ws[i].value);
         }
         free(t->ws);
-        free(t->rs);
+        hashset_destroy(t->rs);
         free(t->to_free);
     }
     free(t);
