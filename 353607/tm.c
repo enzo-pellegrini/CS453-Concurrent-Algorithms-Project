@@ -108,8 +108,6 @@ typedef struct tx_s {
     int rs_n;
     int *to_free;
     int to_free_sz;
-    int *allocated; // to free if allocating transaction fails
-    int allocated_sz;
 } *transaction_t;
 
 bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source, size_t size, void *target);
@@ -152,7 +150,7 @@ shared_t tm_create(size_t size, size_t align) {
 
     // free batching
     tm->to_free_n = 0;
-    tm->to_free_sz = 128;
+    tm->to_free_sz = 64;
     tm->to_free = malloc(tm->to_free_sz*sizeof(int));
 
     int allocation_err = segment_init(&tm->va_arr[0], size, align);
@@ -171,7 +169,6 @@ shared_t tm_create(size_t size, size_t align) {
  * @param shared Shared memory region to destroy, with no running transaction
  **/
 void tm_destroy(shared_t shared) {
-    // TODO: implement freeing
     tm_t tm = (tm_t) shared;
 
     tm_cleanup(tm);
@@ -247,10 +244,6 @@ tx_t tm_begin(shared_t unused(shared), bool is_ro) {
     // Init to-free array
     t->to_free_sz = 0;
     t->to_free = NULL;
-
-    // Init allocated array
-    t->allocated_sz = 0;
-    t->allocated = NULL;
 
     return (tx_t) t;
 }
@@ -341,13 +334,6 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
             for (int i=0; i<tm->to_free_n; i++) {
                 int spot = tm->to_free[i];
                 delete_segment(tm, spot);
-                // segment_cleanup(tm->va_arr[spot]);
-                // tm->va_arr[spot] = NULL;
-
-                // empty_spot_t tmp = malloc(sizeof(struct empty_spot_s));
-                // tmp->index = spot;
-                // tmp->next = tm->empty_spots;
-                // tm->empty_spots = tmp;
             }
             tm->to_free_n = 0;
 
@@ -590,10 +576,6 @@ alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t unused(size), void **u
     *target = va_from_index(spot, 0);
     // printf("Allocated semgment %d, va: %p\n", spot, *target);
 
-    // save allocated segment in transaction
-    transaction->allocated = realloc(transaction->allocated, (++transaction->allocated_sz) * sizeof(int));
-    transaction->allocated[transaction->allocated_sz] = spot;
-
     return success_alloc;
 }
 
@@ -689,24 +671,11 @@ void tm_cleanup(tm_t tm) {
 void transaction_cleanup(tm_t tm, transaction_t t, bool failed) {
     if (failed) {
         pthread_rwlock_unlock(&tm->cleanup_lock);
-
-        if (t->allocated_sz > 0) {
-            // printf("An allocating transaction failed!\n");
-
-            // for (int i=0; i<t->allocated_sz; i++) {
-            //     delete_segment(tm, t->allocated[i]);
-            // }
-        }
-
-        if (!t->is_ro) {
-            // printf("A transaction with %d reads and %d writes failed\n", transaction->rs_n, transaction->ws_n);
-        }
     }
     if (!t->is_ro) {
         free(t->ws);
         free(t->rs);
         free(t->to_free);
-        free(t->allocated);
     }
     free(t);
 }
