@@ -59,6 +59,7 @@ typedef struct empty_spot_s {
 
 typedef struct thread_history_s {
     pthread_t* arr;
+    int* last_wv;
     int n;
     int sz;
 } thread_history_t;
@@ -86,8 +87,8 @@ typedef struct shared_s {
     int to_free_n;
     int to_free_sz;
 
-    thread_history_t thread_history;
     pthread_mutex_t thread_history_lock;
+    thread_history_t thread_history;
 } *tm_t;
 
 /* ************************** *
@@ -109,6 +110,7 @@ int ws_item_cmp(const void *a, const void *b) {
 
 typedef struct tx_s {
     int rv;
+    int last_updater;
     int ti;
     bool is_ro;
     ws_item_t *ws;
@@ -130,6 +132,7 @@ inline int segment_init(segment_t *s, size_t size, size_t align);
 inline void init_thread_history(thread_history_t* ti);
 inline void thread_history_cleanup(thread_history_t ti);
 inline int get_thread_id(thread_history_t const* ti, pthread_t t);
+int* last_wv(thread_history_t const*ti, int my_id);
 inline int insert_thread(thread_history_t* ti, pthread_t t);
 
 // Cleanup functions, do frees
@@ -238,16 +241,21 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     if (t == NULL) {
         return invalid_tx;
     }
-    t->rv = version_to_clock(atomic_load(&tm->global_version));
+
+    int version = atomic_load(&tm->global_version);
+    t->rv = version_to_clock(version);
+    t->last_updater = version_to_ti(version);
     t->is_ro = is_ro;
 
     // Get thread id
+    // TODO: maybe do this at commit time
     pthread_t me = pthread_self();
     int id;
     if ((id = get_thread_id(&tm->thread_history, me)) < 0) {
         pthread_mutex_lock(&tm->thread_history_lock);
         id = insert_thread(&tm->thread_history, me);
         pthread_mutex_unlock(&tm->thread_history_lock);
+        *last_wv(&tm->thread_history, id) = -1;
     }
 
     t->ti = id;
@@ -304,7 +312,7 @@ bool tm_end(shared_t shared, tx_t tx) {
     for (int i = 0; i < t->ws_n; i++) {
         ws_item_t item = t->ws[i];
         // take flag and check version number
-        bool success_locking = vl_try_lock(item.versioned_lock, t->rv);
+        bool success_locking = vl_try_lock(item.versioned_lock, t->rv, t->last_updater);
         if (!success_locking) {
             // abort
             for (int j = 0; j < i; j++) {
@@ -317,15 +325,18 @@ bool tm_end(shared_t shared, tx_t tx) {
         }
     }
 
-    // fetch and increment global version
-    // int wv = atomic_fetch_add(&tm->global_version, 1) + 1;
-
     // new thing
     int wv;
     int read = atomic_load(&tm->global_version);
-    if (version_to_clock(read) == t->rv) {
+    printf("In commiting read %d\n", read);
+    int *last_wvp = last_wv(&tm->thread_history, t->ti);
+    if (*last_wvp == -1) {
+        *last_wvp = version_to_clock(read);
+    }
+    if (version_to_clock(read) == version_to_clock(*last_wvp)) {
         int desired = build_version(version_to_clock(read) + 1, t->ti);
         if (atomic_compare_exchange_strong(&tm->global_version, &read, desired)) {
+            printf("compare and swap succesful, now set it to %x\n", desired);
             wv = desired;
         } else {
             wv = read; // It will have been changed by CAS call
@@ -333,13 +344,14 @@ bool tm_end(shared_t shared, tx_t tx) {
     } else {
         wv = read;
     }
-    wv = build_version(version_to_clock(read), t->ti);
+    wv = build_version(version_to_clock(wv), t->ti);
+    *last_wv(&tm->thread_history, t->ti) = version_to_clock(wv);
 
     // validate read-set
     for (int i = 0; i < t->rs_n; i++) {
         if (t->rs[i] == NULL) continue;
         int version_read = vl_read_version(t->rs[i]);
-        if (version_read == -1 || version_read > t->rv) {
+        if (version_read == -1 || should_abort(version_read, t->rv, t->last_updater)) {
             // abort, unlock all locks
             for (int j = 0; j < t->ws_n; j++) {
                 vl_unlock(t->ws[j].versioned_lock);
@@ -447,9 +459,8 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
             }
         }
 
-        // int ti_latest = get_ti_latest(tm);
         int version_read = vl_read_version(version);
-        if (version_read == -1 || should_abort(version_read, t->rv, t->ti)) {
+        if (version_read == -1 || should_abort(version_read, t->rv, t->last_updater)) {
             // abort
             transaction_cleanup(tm, t, true);
 
@@ -492,7 +503,9 @@ bool ro_transaction_read(tm_t tm, transaction_t t, void const *source, size_t si
     memcpy(target, s->data + offset, size);
     for (int i = 0; i < num_words; i++) {
         int version_read = vl_read_version(&s->locks[start_idx + i]);
-        if (version_read == -1 || should_abort(version_read, t->rv, t->ti)) {
+        if (version_read == -1 || should_abort(version_read, t->rv, t->last_updater)) {
+            printf("ro read failed on %p, I am %d, with rv %d latest_ti %d, read clock %d, thread %d\n", source,
+             t->ti, t->rv, t->last_updater, version_to_clock(version_read), version_to_ti(version_read));
             // word locked, abort
             transaction_cleanup(tm, t, true);
             return false;
@@ -526,12 +539,12 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
     for (int i = 0; i < num_words; i++) {
         // this pre-check is optional
         versioned_lock_t *version_lock = &s->locks[idx_start + i];
-        int version_read = vl_read_version(version_lock);
-        if (version_read == -1 || should_abort(version_read, t->rv, t->ti)) {
-            // word modified or soon to be modified
-            transaction_cleanup(tm, t, true);
-            return false;
-        }
+        // int version_read = vl_read_version(version_lock);
+        // if (version_read == -1 || should_abort(version_read, t->rv, t->ti)) {
+        //     // word modified or soon to be modified
+        //     transaction_cleanup(tm, t, true);
+        //     return false;
+        // }
 
         // Check if word already in write set
         bool found = false;
@@ -729,10 +742,12 @@ void init_thread_history(thread_history_t* ti) {
     ti->sz = VEC_INITIAL;
     ti->n = 0;
     ti->arr = malloc(ti->sz * sizeof(pthread_t));
+    ti->last_wv = malloc(ti->sz * sizeof(int));
 }
 
 void thread_history_cleanup(thread_history_t ti) {
     free(ti.arr);
+    free(ti.last_wv);
 }
 
 int get_thread_id(thread_history_t const *ti, pthread_t t) {
@@ -743,10 +758,15 @@ int get_thread_id(thread_history_t const *ti, pthread_t t) {
     return -1;
 }
 
+int* last_wv(thread_history_t const *ti, int my_id) {
+    return &ti->last_wv[my_id];
+}
+
 int insert_thread(thread_history_t* ti, pthread_t t) {
     if (ti->n >= ti->sz) {
         ti->sz = RESIZE_FACTOR * ti->sz;
         ti->arr = realloc(ti->arr, ti->sz);
+        ti->last_wv = realloc(ti->last_wv, ti->sz);
     }
     ti->arr[ti->n++] = t;
     return ti->n-1;

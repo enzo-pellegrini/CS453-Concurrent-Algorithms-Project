@@ -12,7 +12,7 @@ typedef atomic_int versioned_lock_t;
 
 void vl_init(versioned_lock_t *vl);
 
-bool vl_try_lock(versioned_lock_t *vl, int rv);
+bool vl_try_lock(versioned_lock_t *vl, int rv, int last_updater);
 
 /** Read version
  * @param vl versioned flag

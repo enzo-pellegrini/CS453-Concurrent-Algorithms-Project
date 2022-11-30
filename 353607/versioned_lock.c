@@ -4,9 +4,9 @@
 
 void vl_init(versioned_lock_t *vl) { atomic_store(vl, 0); }
 
-bool vl_try_lock(versioned_lock_t *vl, int rv) {
+bool vl_try_lock(versioned_lock_t *vl, int rv, int last_updater) {
     int prev = atomic_load(vl);
-    if (prev & 0x1 || should_abort(prev, rv, 0)) {
+    if (prev & 0x1 || should_abort(prev, rv, last_updater)) {
         return false;
     }
     bool success = atomic_compare_exchange_strong(vl, &prev, prev | 0x1);
@@ -38,12 +38,9 @@ int build_version(int clock, int ti) { return ((ti & 0xFF) << 23) | (clock & 0x7
 bool should_abort(int version_read, int rv, int ti_latest) {
     int clock = version_to_clock(version_read);
     int ti = version_to_ti(version_read);
-    // if (clock > rv || (clock == rv && ti != ti_latest)) {
-    //     return false;
-    // }
-    if (clock >= rv) {
-        printf("abort, read clock %d, not lower than %d\n", clock, rv);
-        return false; // not perfect
+    // printf("Read clock: %d, ti: %d\n", clock, ti);
+    if (clock > rv || (clock == rv && ti != ti_latest)) {
+        return true;
     }
-    return true;
+    return false;
 }
