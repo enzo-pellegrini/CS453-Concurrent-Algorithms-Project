@@ -186,7 +186,7 @@ of
  * @param shared Shared memory region to query
  * @return First allocated segment size
  **/
-size_t tm_size(shared_t unused(shared)) {
+size_t tm_size(shared_t shared) {
     tm_t tm = (tm_t) shared;
     return tm->va_arr[0]->size;
 }
@@ -207,7 +207,7 @@ size_t tm_align(shared_t shared) {
  * @param is_ro  Whether the transaction is read-only
  * @return Opaque transaction ID, 'invalid_tx' on failure
  **/
-tx_t tm_begin(shared_t unused(shared), bool is_ro) {
+tx_t tm_begin(shared_t shared, bool is_ro) {
     tm_t tm = (tm_t) shared;
 
    pthread_rwlock_rdlock(&tm->cleanup_lock);
@@ -253,7 +253,7 @@ tx_t tm_begin(shared_t unused(shared), bool is_ro) {
  * @param tx     Transaction to end
  * @return Whether the whole transaction committed
  **/
-bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
+bool tm_end(shared_t shared, tx_t tx) {
     tm_t tm = (tm_t) shared;
     transaction_t t = (transaction_t) tx;
 
@@ -358,7 +358,7 @@ shared
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
  **/
-bool tm_read(shared_t unused(shared), tx_t unused(tx), void const *source, size_t size, void *target) {
+bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
     tm_t tm = shared;
     transaction_t transaction = (void *) tx;
 
@@ -471,8 +471,6 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
 
 //    printf("tm_write: %p %p %d", source, target, size);
 
-    unlikely(transaction->is_ro);
-
     segment_t s = tm->va_arr[index_from_va(target)];
     int idx_start = offset_from_va(target) / tm->align;
     int num_words = size / tm->align;
@@ -540,9 +538,9 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
  * @return Whether the whole transaction can continue (success/nomem), or not
  *(abort_alloc)
  **/
-alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t unused(size), void **unused(target)) {
+alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
     tm_t tm = shared;
-    transaction_t transaction = (transaction_t) tx;
+    transaction_t unused(transaction) = (transaction_t) tx;
 
     // printf("tm_alloc called\n");
 

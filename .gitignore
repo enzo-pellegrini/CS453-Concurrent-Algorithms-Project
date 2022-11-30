@@ -18,6 +18,8 @@
 !*.cxx
 !*.c++
 !CMakeLists.txt
+!.clang-format
+!.vscode/settings.json
 
 !*.h
 !*.hh
