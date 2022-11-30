@@ -188,9 +188,7 @@ size_t tm_size(shared_t shared) {
     return tm->va_arr[0]->size;
 }
 
-/** [thread-safe] Return the alignment (in bytes) of the memory accesses on
-the
- *given shared memory region.
+/** [thread-safe] Return the alignment (in bytes) of the memory accesses on the given shared memory region.
  * @param shared Shared memory region to query
  * @return Alignment used globally
  **/
@@ -343,14 +341,11 @@ bool tm_end(shared_t shared, tx_t tx) {
     return true;
 }
 
-/** [thread-safe] Read operation in the given transaction, source in the
-shared
- *region and target in a private region.
+/** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
  * @param shared Shared memory region associated with the transaction
  * @param tx     Transaction to use
  * @param source Source start address (in the shared region)
- * @param size   Length to copy (in bytes), must be a positive multiple of
- the *alignment
+ * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
  **/
@@ -449,14 +444,11 @@ bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source,
     return true;
 }
 
-/** [thread-safe] Write operation in the given transaction, source in a
-private
- *region and target in the shared region.
+/** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
  * @param shared Shared memory region associated with the transaction
  * @param tx     Transaction to use
  * @param source Source start address (in a private region)
- * @param size   Length to copy (in bytes), must be a positive multiple of
- the *alignment
+ * @param size   Length to copy (in bytes), must be a positive multiple of the alignment
  * @param target Target start address (in the shared region)
  * @return Whether the whole transaction can continue
  **/
@@ -471,8 +463,9 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
     int num_words = size / tm->align;
 
     for (int i = 0; i < num_words; i++) {
-        //    int version = atomic_load(&s->locks[idx_start + i].version);
         versioned_lock_t *version_lock = &s->locks[idx_start + i];
+        
+        // Optional check
         int version_read = vl_read_version(version_lock);
         if (version_read == -1 || version_read > transaction->rv) {
             // word modified or soon to be modified
@@ -500,7 +493,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
             transaction->ws = realloc(transaction->ws, transaction->ws_sz * sizeof(ws_item_t));
             if (transaction->ws == NULL) {
                 transaction_cleanup(tm, transaction, true);
-                //                printf("aborting transaction because of malloc\n");
+                // printf("aborting transaction because of malloc\n");
                 return false;
             }
         }
@@ -530,8 +523,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
  * @param tx     Transaction to use
  * @param size   Allocation requested size (in bytes), must be a positive multiple of the alignment
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
- * @return Whether the whole transaction can continue (success/nomem), or not
- *(abort_alloc)
+ * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
  **/
 alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
     tm_t tm = shared;
@@ -557,7 +549,6 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
     int mem_err = segment_init(seg_ptr, size, tm->align);
     if (mem_err != 0) {
         empty_spot_t tmp = malloc(sizeof(struct empty_spot_s));
-        unlikely(tmp == NULL);
         tmp->index = spot;
         tmp->next = tm->empty_spots;
         tm->empty_spots = tmp;
@@ -574,13 +565,11 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
 /** [thread-safe] Memory freeing in the given transaction.
  * @param shared Shared memory region associated with the transaction
  * @param tx     Transaction to use
- * @param target Address of the first byte of the previously allocated
- segment *to deallocate
+ * @param target Address of the first byte of the previously allocated segment to deallocate
  * @return Whether the whole transaction can continue
  **/
 bool tm_free(shared_t unused(shared), tx_t tx, void *target) {
     transaction_t transaction = (transaction_t)tx;
-
     int spot = index_from_va(target);
     // printf("tm_free called with spot=%d\n", spot);
 
@@ -666,6 +655,9 @@ void transaction_cleanup(tm_t tm, transaction_t t, bool failed) {
         pthread_rwlock_unlock(&tm->cleanup_lock);
     }
     if (!t->is_ro) {
+        for (int i=0; i<t->ws_n; i++) {
+            free(t->ws[i].value);
+        }
         free(t->ws);
         free(t->rs);
         free(t->to_free);

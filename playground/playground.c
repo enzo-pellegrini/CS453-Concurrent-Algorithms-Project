@@ -20,26 +20,33 @@ void *thread(void *arg) {
     while (!success) {
         tx_t tx = tm_begin(shared, false);
         if (tx == invalid_tx) {
-            printf("%d: tm_begin failed", my_id);
+            // printf("%d: tm_begin failed", my_id);
             continue;
         }
 
-        char* source = malloc(64);
+        char data[64];
+        char* source = data;
         for (int i=0; i<64; i++) {
             source[i] = i;
         }
 
         if (!tm_write(shared, tx, source, 64, tm_start(shared))) {
-            printf("%d: tm_write failed\n", my_id);
+            // printf("%d: tm_write failed\n", my_id);
+            continue;
+        }
+
+        void* addr;
+        if (tm_alloc(shared, tx, 512, &addr) != success_alloc) {
+            printf("tm_alloc failed\n");
             continue;
         }
 
         if (!tm_end(shared, tx)) {
-            printf("%d: tm_end failed\n", my_id);
+            // printf("%d: tm_end failed\n", my_id);
             continue;
         }
 
-        printf("%d: success\n", my_id);
+        // printf("%d: success\n", my_id);
 
         success = true;
     }
@@ -50,18 +57,26 @@ void *thread(void *arg) {
 #define NUM_THREADS 8
 
 int main() {
-    shared_t shared = tm_create(1024, 8);
+    printf("I have pid: %d\n", getpid());
 
-    pthread_t ts[NUM_THREADS];
-    for (int i=0; i<NUM_THREADS; i++) {
-        pthread_create(&ts[i], NULL, thread, shared);
+    for (int i=0; i<1000; i++) {
+        printf("%d.", i);
+        shared_t shared = tm_create(1024, 8);
+
+        pthread_t ts[NUM_THREADS];
+        for (int i=0; i<NUM_THREADS; i++) {
+            pthread_create(&ts[i], NULL, thread, shared);
+        }
+
+        atomic_store(&flag, true);
+
+        for (int i=0; i<NUM_THREADS; i++) {
+            pthread_join(ts[i], NULL);
+        }
+
+        tm_destroy(shared);
     }
 
-    atomic_store(&flag, true);
-
-    for (int i=0; i<NUM_THREADS; i++) {
-        pthread_join(ts[i], NULL);
-    }
-
-    tm_destroy(shared);
+    int n = 0;
+    scanf("%d", &n);
 }
