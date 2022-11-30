@@ -178,6 +178,8 @@ bool Transaction::write(SharedRegion *sr, const void *source, size_t size, void 
 }
 
 Alloc Transaction::alloc(SharedRegion *sr, size_t size, void **target) {
+    // std::cout << "Called tm_alloc\n";
+
     sr->virtualMemoryLock.lock();
 
     int spot;
