@@ -14,8 +14,6 @@
  **/
 
 // Requested features
-#include <malloc/_malloc.h>
-#include <sys/_pthread/_pthread_mutex_t.h>
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #ifdef __STDC_NO_ATOMICS__
@@ -29,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
 // Internal headers
 #include <tm.h>
@@ -37,6 +36,9 @@
 #include "versioned_lock.h"
 
 #define VA_SIZE 65536
+#define VEC_INITIAL 8
+#define RESIZE_FACTOR 1.2
+#define FREE_BATCHSIZE 64
 
 /* *********************************** *
  * STRUCTURES FOR TRANSACTIONAL MEMORY *
@@ -53,12 +55,6 @@ typedef struct empty_spot_s {
     struct empty_spot_s *next;
     int index;
 } *empty_spot_t;
-
-typedef struct mb_s {
-    void* data;
-    size_t pos;
-    size_t size;
-} mb_t;
 
 typedef struct shared_s {
     size_t align;
@@ -82,10 +78,6 @@ typedef struct shared_s {
     int* to_free;
     int to_free_n;
     int to_free_sz;
-
-    // source of all memory
-    mb_t* memory_blocks;
-    int memory_blocks_n;
 } *tm_t;
 
 /* ************************** *
@@ -123,70 +115,15 @@ typedef struct tx_s {
 bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source, size_t size, void *target);
 
 // Segment function signatures
-inline int allocate_segment(tm_t tm);
-
 inline int segment_init(segment_t *s, size_t size, size_t align);
 
-inline segment_t segment_at(segment_t ****virtual_memory, int idx);
-
-inline segment_t *segment_at_p(segment_t ****virtual_memory, int idx);
-
 // Cleanup functions, do frees
-void segment_cleanup(segment_t segment) {
-    free(segment->data);
-    free(segment->locks);
-    free(segment);
-}
+inline void segment_cleanup(segment_t segment);
+inline void tm_cleanup(tm_t tm);
+inline void transaction_cleanup(tm_t tm, transaction_t transaction, bool failed);
 
-void tm_cleanup(tm_t tm) {
-    for (int i = 0; i < tm->va_n; i++) {
-        if (tm->va_arr[i] != NULL)
-            segment_cleanup(tm->va_arr[i]);
-    }
-    while (tm->empty_spots != NULL) {
-        empty_spot_t tmp = tm->empty_spots;
-        tm->empty_spots = tm->empty_spots->next;
-        free(tmp);
-    }
-    free(tm->va_arr);
-    pthread_rwlock_destroy(&tm->cleanup_lock);
-    pthread_mutex_destroy(&tm->virtual_memory_lock);
-    free(tm);
-}
-
-// Massive block functions
-
-void mb_init(mb_t* mb, size_t align) {
-    int err = posix_memalign(&mb->data, align, 1048576);
-    if (err != 0) {
-        exit(1);
-    }
-    mb->size = 1048576;
-    mb->pos = 0;
-}
-
-void* mb_get_chunk(mb_t* mb, size_t size) {
-    if (mb->size - mb->pos < size) {
-        // There's not enough space left in this chunk
-        return NULL;
-    }
-    void* start = mb->data + mb->pos;
-    mb->pos += size;
-    return start;
-}
-
-void transaction_cleanup(tm_t tm, transaction_t transaction, bool failed) {
-    if (failed) {
-        pthread_rwlock_unlock(&tm->cleanup_lock);
-    }
-    if (!transaction->is_ro) {
-        free(transaction->ws);
-        free(transaction->rs);
-        free(transaction->to_free);
-        free(transaction->allocated);
-    }
-    free(transaction);
-}
+// Utility functions
+void delete_segment(tm_t tm, int spot);
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
  * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
@@ -207,11 +144,6 @@ shared_t tm_create(size_t size, size_t align) {
     unlikely(pthread_rwlock_init(&tm->cleanup_lock, NULL));
     unlikely(pthread_mutex_init(&tm->virtual_memory_lock, NULL));
     unlikely(pthread_mutex_init(&tm->to_free_lock, NULL));
-
-    // memory blocks
-    // tm->memory_blocks_n = 1;
-    // tm->memory_blocks = malloc(tm->memory_blocks_n * sizeof(struct mb_s));
-    // mb_init(&tm->memory_blocks[0], align);
 
     // virtual memory
     tm->va_arr = malloc(VA_SIZE * sizeof(segment_t));
@@ -294,7 +226,7 @@ tx_t tm_begin(shared_t unused(shared), bool is_ro) {
     }
 
     // Allocate read-set
-    t->rs_sz = 8;
+    t->rs_sz = VEC_INITIAL;
     t->rs_n = 0;
     t->rs = malloc(t->rs_sz * sizeof(rs_item_t));
     if (t->rs == NULL) {
@@ -303,7 +235,7 @@ tx_t tm_begin(shared_t unused(shared), bool is_ro) {
     }
 
     // Allocate write-set
-    t->ws_sz = 8;
+    t->ws_sz = VEC_INITIAL;
     t->ws_n = 0;
     t->ws = malloc(t->ws_sz * sizeof(struct ws_item_s));
     if (t->ws == NULL) {
@@ -333,12 +265,13 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
     transaction_t t = (transaction_t) tx;
 
     if (t->is_ro) {
+        pthread_rwlock_unlock(&tm->cleanup_lock);
         free(t);
         return true;
     }
 
     // sort the write-set
-    qsort(t->ws, t->ws_n, sizeof(ws_item_t), ws_item_cmp);
+    // qsort(t->ws, t->ws_n, sizeof(ws_item_t), ws_item_cmp);
 
     // try to lock each item in the write-set
     for (int i = 0; i < t->ws_n; i++) {
@@ -395,25 +328,34 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
 
         for (int i=0; i < t->to_free_sz; i++) {
             int spot = t->to_free[i];
-        //     segment_cleanup(tm->va_arr[spot]);
-        //     empty_spot_t tmp = malloc(sizeof(struct empty_spot_s));
-        //     tmp->index = spot;
-        //     tmp->next = tm->empty_spots;
-        //     tm->empty_spots = tmp;
-
-            // printf("Dealloced segment %d\n", spot);
             if (tm->to_free_n + 1 >= tm->to_free_sz) {
-                tm->to_free_sz = 2 * tm->to_free_sz;
+                tm->to_free_sz = RESIZE_FACTOR * tm->to_free_sz;
                 tm->to_free = realloc(tm->to_free, tm->to_free_sz * sizeof(int));
             }
             tm->to_free[tm->to_free_n++] = spot;
         }
 
-        // pthread_rwlock_unlock(&tm->cleanup_lock);
+        if (tm->to_free_n >= FREE_BATCHSIZE) {
+            pthread_rwlock_wrlock(&tm->cleanup_lock);
+            
+            for (int i=0; i<tm->to_free_n; i++) {
+                int spot = tm->to_free[i];
+                delete_segment(tm, spot);
+                // segment_cleanup(tm->va_arr[spot]);
+                // tm->va_arr[spot] = NULL;
+
+                // empty_spot_t tmp = malloc(sizeof(struct empty_spot_s));
+                // tmp->index = spot;
+                // tmp->next = tm->empty_spots;
+                // tm->empty_spots = tmp;
+            }
+            tm->to_free_n = 0;
+
+            pthread_rwlock_unlock(&tm->cleanup_lock);
+        }
+
         pthread_mutex_unlock(&tm->to_free_lock);
     }
-
-    // printf("commited transaction with %d reads and %d writes\n", t->rs_n, t->ws_n);
 
     transaction_cleanup(tm, t, false);
     return true;
@@ -492,7 +434,7 @@ bool tm_read(shared_t unused(shared), tx_t unused(tx), void const *source, size_
         }
         // Add word to read set
         if (transaction->rs_n == transaction->rs_sz) {
-            transaction->rs_sz *= 2;
+            transaction->rs_sz *= RESIZE_FACTOR;
             transaction->rs = realloc(transaction->rs, transaction->rs_sz * sizeof(rs_item_t));
             if (transaction->rs == NULL) {
                 transaction_cleanup(tm, transaction, true);
@@ -511,8 +453,10 @@ bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source,
     int start_idx = offset / tm->align;
     int num_words = size / tm->align;
 
+    assert(num_words > 0 && offset + size <= s->size); // sanity check
+
+    memcpy(target, s->data + offset, size);
     for (int i = 0; i < num_words; i++) {
-        memcpy(target + i * tm->align, s->data + offset + i * tm->align, tm->align);
         int versionRead = vl_read_version(&s->locks[start_idx + i]);
         if (versionRead == -1 || versionRead > transaction->rv) {
             // word locked, abort
@@ -573,7 +517,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
 
         // Add word to write set
         if (transaction->ws_n == transaction->ws_sz) {
-            transaction->ws_sz *= 2;
+            transaction->ws_sz *= RESIZE_FACTOR;
             transaction->ws = realloc(transaction->ws, transaction->ws_sz * sizeof(ws_item_t));
             if (transaction->ws == NULL) {
                 transaction_cleanup(tm, transaction, true);
@@ -676,6 +620,18 @@ bool tm_free(shared_t unused(shared), tx_t tx, void *target) {
  * IMPLEMENTATION OF INTERNAL FUNCTIONS *
  * ************************************ */
 
+// Utility functions
+
+void delete_segment(tm_t tm, int spot) {
+    segment_cleanup(tm->va_arr[spot]);
+    tm->va_arr[spot] = NULL;
+
+    empty_spot_t tmp = malloc(sizeof(struct empty_spot_s));
+    tmp->index = spot;
+    tmp->next = tm->empty_spots;
+    tm->empty_spots = tmp;
+}
+
 int segment_init(segment_t *sp, size_t size, size_t align) {
     *sp = malloc(sizeof(struct segment_s));
     segment_t s = *sp;
@@ -685,7 +641,7 @@ int segment_init(segment_t *sp, size_t size, size_t align) {
         return err;
     }
 
-    printf("allocated segment of size: %d\n", size);
+    // printf("allocated segment of size: %zu\n", size);
 
     // initialize with zeros
     memset(s->data, 0, size);
@@ -704,4 +660,53 @@ int segment_init(segment_t *sp, size_t size, size_t align) {
     s->size = size;
 
     return 0;
+}
+
+// Cleanup functions
+
+void segment_cleanup(segment_t segment) {
+    free(segment->data);
+    free(segment->locks);
+    free(segment);
+}
+
+void tm_cleanup(tm_t tm) {
+    for (int i = 0; i < tm->va_n; i++) {
+        if (tm->va_arr[i] != NULL)
+            segment_cleanup(tm->va_arr[i]);
+    }
+    while (tm->empty_spots != NULL) {
+        empty_spot_t tmp = tm->empty_spots;
+        tm->empty_spots = tm->empty_spots->next;
+        free(tmp);
+    }
+    free(tm->va_arr);
+    pthread_rwlock_destroy(&tm->cleanup_lock);
+    pthread_mutex_destroy(&tm->virtual_memory_lock);
+    free(tm);
+}
+
+void transaction_cleanup(tm_t tm, transaction_t t, bool failed) {
+    if (failed) {
+        pthread_rwlock_unlock(&tm->cleanup_lock);
+
+        if (t->allocated_sz > 0) {
+            // printf("An allocating transaction failed!\n");
+
+            // for (int i=0; i<t->allocated_sz; i++) {
+            //     delete_segment(tm, t->allocated[i]);
+            // }
+        }
+
+        if (!t->is_ro) {
+            // printf("A transaction with %d reads and %d writes failed\n", transaction->rs_n, transaction->ws_n);
+        }
+    }
+    if (!t->is_ro) {
+        free(t->ws);
+        free(t->rs);
+        free(t->to_free);
+        free(t->allocated);
+    }
+    free(t);
 }
