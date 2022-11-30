@@ -24,4 +24,10 @@ void vl_unlock(versioned_lock_t *vl);
 
 void vl_unlock_update(versioned_lock_t *vl, int version);
 
+int version_to_clock(int version);
+int version_to_ti(int version);
+int build_version(int clock, int ti);
+
+bool should_abort(int version_read, int rv, int ti_latest);
+
 #endif // CS453_CONCURRENT_ALGORITHMS_PROJECT_VERSIONED_LOCK_H

@@ -14,6 +14,7 @@
  **/
 
 // Requested features
+#include <unistd.h>
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #ifdef __STDC_NO_ATOMICS__
@@ -56,6 +57,12 @@ typedef struct empty_spot_s {
     int index;
 } *empty_spot_t;
 
+typedef struct thread_history_s {
+    pthread_t* arr;
+    int n;
+    int sz;
+} thread_history_t;
+
 typedef struct shared_s {
     size_t align;
 
@@ -78,6 +85,9 @@ typedef struct shared_s {
     int* to_free;
     int to_free_n;
     int to_free_sz;
+
+    thread_history_t thread_history;
+    pthread_mutex_t thread_history_lock;
 } *tm_t;
 
 /* ************************** *
@@ -99,6 +109,7 @@ int ws_item_cmp(const void *a, const void *b) {
 
 typedef struct tx_s {
     int rv;
+    int ti;
     bool is_ro;
     ws_item_t *ws;
     int ws_sz;
@@ -115,12 +126,19 @@ bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source,
 // Segment function signatures
 inline int segment_init(segment_t *s, size_t size, size_t align);
 
+// Thread history functions
+inline void init_thread_history(thread_history_t* ti);
+inline void thread_history_cleanup(thread_history_t ti);
+inline int get_thread_id(thread_history_t const* ti, pthread_t t);
+inline int insert_thread(thread_history_t* ti, pthread_t t);
+
 // Cleanup functions, do frees
 inline void segment_cleanup(segment_t segment);
 inline void tm_cleanup(tm_t tm);
 inline void transaction_cleanup(tm_t tm, transaction_t transaction, bool failed);
 
 // Utility functions
+int get_ti_latest(tm_t tm);
 void delete_segment(tm_t tm, int spot);
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
@@ -137,11 +155,12 @@ shared_t tm_create(size_t size, size_t align) {
 
     tm->align = align;
 
-    atomic_store(&tm->global_version, 0);
+    atomic_store(&tm->global_version, 1);
 
     unlikely(pthread_rwlock_init(&tm->cleanup_lock, NULL));
     unlikely(pthread_mutex_init(&tm->virtual_memory_lock, NULL));
     unlikely(pthread_mutex_init(&tm->to_free_lock, NULL));
+    unlikely(pthread_mutex_init(&tm->thread_history_lock, NULL));
 
     // virtual memory
     tm->va_arr = malloc(VA_SIZE * sizeof(segment_t));
@@ -160,6 +179,9 @@ shared_t tm_create(size_t size, size_t align) {
     }
 
     tm->va_n++;
+
+    // Thread history init
+    init_thread_history(&tm->thread_history);
 
     return tm;
 }
@@ -216,8 +238,20 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     if (t == NULL) {
         return invalid_tx;
     }
-    t->rv = atomic_load(&tm->global_version);
+    t->rv = version_to_clock(atomic_load(&tm->global_version));
     t->is_ro = is_ro;
+
+    // Get thread id
+    pthread_t me = pthread_self();
+    int id;
+    if ((id = get_thread_id(&tm->thread_history, me)) < 0) {
+        pthread_mutex_lock(&tm->thread_history_lock);
+        id = insert_thread(&tm->thread_history, me);
+        pthread_mutex_unlock(&tm->thread_history_lock);
+    }
+
+    t->ti = id;
+
     if (is_ro) {
         return (tx_t) t; // I didn't actually need as much space as I allocated
     }
@@ -284,34 +318,47 @@ bool tm_end(shared_t shared, tx_t tx) {
     }
 
     // fetch and increment global version
-    int wv = atomic_fetch_add(&tm->global_version, 1) + 1;
+    // int wv = atomic_fetch_add(&tm->global_version, 1) + 1;
 
-    if (t->rv + 1 != wv) {
-        // check version number and if it is locked for each item in read-set,
-        for (int i = 0; i < t->rs_n; i++) {
-            if (t->rs[i] == NULL) continue;
-            int version_read = vl_read_version(t->rs[i]);
-            if (version_read == -1 || version_read > t->rv) {
-                // abort, unlock all locks
-                for (int j = 0; j < t->ws_n; j++) {
-                    vl_unlock(t->ws[j].versioned_lock);
-                }
+    // new thing
+    int wv;
+    int read = atomic_load(&tm->global_version);
+    if (version_to_clock(read) == t->rv) {
+        int desired = build_version(version_to_clock(read) + 1, t->ti);
+        if (atomic_compare_exchange_strong(&tm->global_version, &read, desired)) {
+            wv = desired;
+        } else {
+            wv = read; // It will have been changed by CAS call
+        }
+    } else {
+        wv = read;
+    }
+    wv = build_version(version_to_clock(read), t->ti);
 
-                transaction_cleanup(tm, t, true);
-
-                return false;
+    // validate read-set
+    for (int i = 0; i < t->rs_n; i++) {
+        if (t->rs[i] == NULL) continue;
+        int version_read = vl_read_version(t->rs[i]);
+        if (version_read == -1 || version_read > t->rv) {
+            // abort, unlock all locks
+            for (int j = 0; j < t->ws_n; j++) {
+                vl_unlock(t->ws[j].versioned_lock);
             }
+
+            transaction_cleanup(tm, t, true);
+
+            return false;
         }
     }
 
-
-    // for each item in write set, write to memory, set version number to wv and
-    // unlock
+    // for each item in write set, write to memory, set version number to wv and unlock
     for (int i = 0; i < t->ws_n; i++) {
         ws_item_t item = t->ws[i];
         memcpy(item.raw_addr, item.value, tm->align);
         vl_unlock_update(item.versioned_lock, wv);
     }
+
+    printf("transaction commited\n");
 
 
     pthread_rwlock_unlock(&tm->cleanup_lock);
@@ -360,10 +407,10 @@ shared
  **/
 bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
     tm_t tm = shared;
-    transaction_t transaction = (void *) tx;
+    transaction_t t = (void *) tx;
 
-    if (transaction->is_ro) {
-        return ro_transaction_read(tm, transaction, source, size, target);
+    if (t->is_ro) {
+        return ro_transaction_read(tm, t, source, size, target);
     }
 
     int align = tm->align;
@@ -377,9 +424,9 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
         bool found = false;
 
         // Check if word is present in the write set
-        for (int j = 0; j < transaction->ws_n; j++) {
-            if (transaction->ws[j].addr == source + i * align) {
-                memcpy(target, transaction->ws[j].value, align);
+        for (int j = 0; j < t->ws_n; j++) {
+            if (t->ws[j].addr == source + i * align) {
+                memcpy(target, t->ws[j].value, align);
                 found = true;
                 break;
             }
@@ -393,25 +440,26 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
 
         // Check if word is present in the read set
         bool found_in_readset = false;
-        for (int j = 0; j < transaction->rs_n; j++) {
-            if (transaction->rs[j] == version) {
+        for (int j = 0; j < t->rs_n; j++) {
+            if (t->rs[j] == version) {
                 found_in_readset = true;
                 break;
             }
         }
 
+        // int ti_latest = get_ti_latest(tm);
         int version_read = vl_read_version(version);
-        if (version_read == -1 || version_read > transaction->rv) {
+        if (version_read == -1 || should_abort(version_read, t->rv, t->ti)) {
             // abort
-            transaction_cleanup(tm, transaction, true);
+            transaction_cleanup(tm, t, true);
 
-//            printf("aborting transaction because of version number\n");
+            // printf("aborting transaction because of version number\n");
             return false;
         }
         memcpy(target + i * align, s->data + (start_word + i) * align, align);
-        if (vl_read_version(version) != version_read) {
+        if (vl_read_version(version) != version_read) { // TODO: check if this is still necessary
             // version number changed, abort
-            transaction_cleanup(tm, transaction, true);
+            transaction_cleanup(tm, t, true);
             return false;
         }
 
@@ -419,21 +467,21 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
             return true;
         }
         // Add word to read set
-        if (transaction->rs_n == transaction->rs_sz) {
-            transaction->rs_sz *= RESIZE_FACTOR;
-            transaction->rs = realloc(transaction->rs, transaction->rs_sz * sizeof(rs_item_t));
-            if (transaction->rs == NULL) {
-                transaction_cleanup(tm, transaction, true);
+        if (t->rs_n == t->rs_sz) {
+            t->rs_sz *= RESIZE_FACTOR;
+            t->rs = realloc(t->rs, t->rs_sz * sizeof(rs_item_t));
+            if (t->rs == NULL) {
+                transaction_cleanup(tm, t, true);
                 return false;
             }
         }
-        transaction->rs[transaction->rs_n++] = (rs_item_t) {version};
+        t->rs[t->rs_n++] = (rs_item_t) {version};
     }
 
     return true;
 }
 
-bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source, size_t size, void *target) {
+bool ro_transaction_read(tm_t tm, transaction_t t, void const *source, size_t size, void *target) {
     segment_t s = tm->va_arr[index_from_va(source)];
     size_t offset = offset_from_va(source);
     int start_idx = offset / tm->align;
@@ -443,10 +491,10 @@ bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source,
 
     memcpy(target, s->data + offset, size);
     for (int i = 0; i < num_words; i++) {
-        int versionRead = vl_read_version(&s->locks[start_idx + i]);
-        if (versionRead == -1 || versionRead > transaction->rv) {
+        int version_read = vl_read_version(&s->locks[start_idx + i]);
+        if (version_read == -1 || should_abort(version_read, t->rv, t->ti)) {
             // word locked, abort
-            transaction_cleanup(tm, transaction, true);
+            transaction_cleanup(tm, t, true);
             return false;
         }
     }
@@ -467,30 +515,30 @@ private
  **/
 bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
     tm_t tm = shared;
-    transaction_t transaction = (transaction_t) tx;
+    transaction_t t = (transaction_t) tx;
 
-//    printf("tm_write: %p %p %d", source, target, size);
+    // printf("tm_write: %p %p %d", source, target, size);
 
     segment_t s = tm->va_arr[index_from_va(target)];
     int idx_start = offset_from_va(target) / tm->align;
     int num_words = size / tm->align;
 
     for (int i = 0; i < num_words; i++) {
-        //    int version = atomic_load(&s->locks[idx_start + i].version);
+        // this pre-check is optional
         versioned_lock_t *version_lock = &s->locks[idx_start + i];
         int version_read = vl_read_version(version_lock);
-        if (version_read == -1 || version_read > transaction->rv) {
+        if (version_read == -1 || should_abort(version_read, t->rv, t->ti)) {
             // word modified or soon to be modified
-            transaction_cleanup(tm, transaction, true);
+            transaction_cleanup(tm, t, true);
             return false;
         }
 
         // Check if word already in write set
         bool found = false;
-        for (int j = 0; j < transaction->ws_n; j++) {
-            if (transaction->ws[j].addr == target + i * tm->align) {
+        for (int j = 0; j < t->ws_n; j++) {
+            if (t->ws[j].addr == target + i * tm->align) {
                 found = true;
-                memcpy(transaction->ws[j].value, source + i * tm->align, tm->align);
+                memcpy(t->ws[j].value, source + i * tm->align, tm->align);
                 break;
             }
         }
@@ -500,28 +548,28 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
         }
 
         // Add word to write set
-        if (transaction->ws_n == transaction->ws_sz) {
-            transaction->ws_sz *= RESIZE_FACTOR;
-            transaction->ws = realloc(transaction->ws, transaction->ws_sz * sizeof(ws_item_t));
-            if (transaction->ws == NULL) {
-                transaction_cleanup(tm, transaction, true);
-//                printf("aborting transaction because of malloc\n");
+        if (t->ws_n == t->ws_sz) {
+            t->ws_sz *= RESIZE_FACTOR;
+            t->ws = realloc(t->ws, t->ws_sz * sizeof(ws_item_t));
+            if (t->ws == NULL) {
+                transaction_cleanup(tm, t, true);
+                // printf("aborting transaction because of malloc\n");
                 return false;
             }
         }
         void *tmp = malloc(tm->align);
         if (tmp == NULL) {
-            transaction_cleanup(tm, transaction, true);
+            transaction_cleanup(tm, t, true);
             return false;
         }
         memcpy(tmp, source + i * tm->align, tm->align);
         void *raw_address = s->data + (idx_start + i) * tm->align;
-        transaction->ws[transaction->ws_n++] = (ws_item_t) {target + i * tm->align, tmp, raw_address, version_lock};
+        t->ws[t->ws_n++] = (ws_item_t) {target + i * tm->align, tmp, raw_address, version_lock};
 
         // remove word from read-set
-        for (int i=0; i<transaction->rs_n; i++) {
-            if (transaction->rs[i] == version_lock) {
-                transaction->rs[i] = NULL;
+        for (int i=0; i<t->rs_n; i++) {
+            if (t->rs[i] == version_lock) {
+                t->rs[i] = NULL;
                 break;
             }
         }
@@ -562,7 +610,6 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
     int mem_err = segment_init(seg_ptr, size, tm->align);
     if (mem_err != 0) {
         empty_spot_t tmp = malloc(sizeof(struct empty_spot_s));
-        unlikely(tmp == NULL);
         tmp->index = spot;
         tmp->next = tm->empty_spots;
         tm->empty_spots = tmp;
@@ -676,4 +723,36 @@ void transaction_cleanup(tm_t tm, transaction_t t, bool failed) {
         free(t->to_free);
     }
     free(t);
+}
+
+void init_thread_history(thread_history_t* ti) {
+    ti->sz = VEC_INITIAL;
+    ti->n = 0;
+    ti->arr = malloc(ti->sz * sizeof(pthread_t));
+}
+
+void thread_history_cleanup(thread_history_t ti) {
+    free(ti.arr);
+}
+
+int get_thread_id(thread_history_t const *ti, pthread_t t) {
+    for (int i=0; i<ti->sz; i++) {
+        if (pthread_equal(ti->arr[i], t) != 0) // This api is really weird
+            return i;
+    }
+    return -1;
+}
+
+int insert_thread(thread_history_t* ti, pthread_t t) {
+    if (ti->n >= ti->sz) {
+        ti->sz = RESIZE_FACTOR * ti->sz;
+        ti->arr = realloc(ti->arr, ti->sz);
+    }
+    ti->arr[ti->n++] = t;
+    return ti->n-1;
+}
+
+int get_ti_latest(tm_t tm) {
+    int version_read = atomic_load(&tm->global_version); // Could be expensive
+    return version_to_ti(version_read);
 }
