@@ -21,13 +21,13 @@
 #endif
 
 // External headers
+#include <assert.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 
 // Internal headers
 #include <tm.h>
@@ -49,12 +49,12 @@ typedef struct segment_s {
     int num_words; // might be redundant
     versioned_lock_t *locks;
     void *data;
-} *segment_t;
+} * segment_t;
 
 typedef struct empty_spot_s {
     struct empty_spot_s *next;
     int index;
-} *empty_spot_t;
+} * empty_spot_t;
 
 typedef struct shared_s {
     size_t align;
@@ -75,16 +75,16 @@ typedef struct shared_s {
 
     // to_free buffer
     pthread_mutex_t to_free_lock;
-    int* to_free;
+    int *to_free;
     int to_free_n;
     int to_free_sz;
-} *tm_t;
+} * tm_t;
 
 /* ************************** *
  * STRUCTURES FOR TRANSACTION *
  * ************************** */
 
-typedef versioned_lock_t* rs_item_t;
+typedef versioned_lock_t *rs_item_t;
 
 typedef struct ws_item_s {
     void *addr;  // virtual address
@@ -93,9 +93,7 @@ typedef struct ws_item_s {
     versioned_lock_t *versioned_lock;
 } ws_item_t;
 
-int ws_item_cmp(const void *a, const void *b) {
-    return ((ws_item_t *) a)->addr - ((ws_item_t *) b)->addr;
-}
+int ws_item_cmp(const void *a, const void *b) { return ((ws_item_t *)a)->addr - ((ws_item_t *)b)->addr; }
 
 typedef struct tx_s {
     int rv;
@@ -108,7 +106,7 @@ typedef struct tx_s {
     int rs_n;
     int *to_free;
     int to_free_sz;
-} *transaction_t;
+} * transaction_t;
 
 bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source, size_t size, void *target);
 
@@ -151,7 +149,7 @@ shared_t tm_create(size_t size, size_t align) {
     // free batching
     tm->to_free_n = 0;
     tm->to_free_sz = 64;
-    tm->to_free = malloc(tm->to_free_sz*sizeof(int));
+    tm->to_free = malloc(tm->to_free_sz * sizeof(int));
 
     int allocation_err = segment_init(&tm->va_arr[0], size, align);
     if (allocation_err != 0) {
@@ -164,12 +162,11 @@ shared_t tm_create(size_t size, size_t align) {
     return tm;
 }
 
-
 /** Destroy (i.e. clean-up + free) a given shared memory region.
  * @param shared Shared memory region to destroy, with no running transaction
  **/
 void tm_destroy(shared_t shared) {
-    tm_t tm = (tm_t) shared;
+    tm_t tm = (tm_t)shared;
 
     tm_cleanup(tm);
 }
@@ -187,7 +184,7 @@ of
  * @return First allocated segment size
  **/
 size_t tm_size(shared_t shared) {
-    tm_t tm = (tm_t) shared;
+    tm_t tm = (tm_t)shared;
     return tm->va_arr[0]->size;
 }
 
@@ -208,9 +205,9 @@ size_t tm_align(shared_t shared) {
  * @return Opaque transaction ID, 'invalid_tx' on failure
  **/
 tx_t tm_begin(shared_t shared, bool is_ro) {
-    tm_t tm = (tm_t) shared;
+    tm_t tm = (tm_t)shared;
 
-   pthread_rwlock_rdlock(&tm->cleanup_lock);
+    pthread_rwlock_rdlock(&tm->cleanup_lock);
 
     transaction_t t = malloc(sizeof(struct tx_s));
     if (t == NULL) {
@@ -219,7 +216,7 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     t->rv = atomic_load(&tm->global_version);
     t->is_ro = is_ro;
     if (is_ro) {
-        return (tx_t) t; // I didn't actually need as much space as I allocated
+        return (tx_t)t; // I didn't actually need as much space as I allocated
     }
 
     // Allocate read-set
@@ -245,7 +242,7 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     t->to_free_sz = 0;
     t->to_free = NULL;
 
-    return (tx_t) t;
+    return (tx_t)t;
 }
 
 /** [thread-safe] End the given transaction.
@@ -254,8 +251,8 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
  * @return Whether the whole transaction committed
  **/
 bool tm_end(shared_t shared, tx_t tx) {
-    tm_t tm = (tm_t) shared;
-    transaction_t t = (transaction_t) tx;
+    tm_t tm = (tm_t)shared;
+    transaction_t t = (transaction_t)tx;
 
     if (t->is_ro) {
         pthread_rwlock_unlock(&tm->cleanup_lock);
@@ -289,7 +286,8 @@ bool tm_end(shared_t shared, tx_t tx) {
     if (t->rv + 1 != wv) {
         // check version number and if it is locked for each item in read-set,
         for (int i = 0; i < t->rs_n; i++) {
-            if (t->rs[i] == NULL) continue;
+            if (t->rs[i] == NULL)
+                continue;
             int version_read = vl_read_version(t->rs[i]);
             if (version_read == -1 || version_read > t->rv) {
                 // abort, unlock all locks
@@ -304,7 +302,6 @@ bool tm_end(shared_t shared, tx_t tx) {
         }
     }
 
-
     // for each item in write set, write to memory, set version number to wv and
     // unlock
     for (int i = 0; i < t->ws_n; i++) {
@@ -313,13 +310,12 @@ bool tm_end(shared_t shared, tx_t tx) {
         vl_unlock_update(item.versioned_lock, wv);
     }
 
-
     pthread_rwlock_unlock(&tm->cleanup_lock);
 
     if (t->to_free_sz > 0) {
         pthread_mutex_lock(&tm->to_free_lock);
 
-        for (int i=0; i < t->to_free_sz; i++) {
+        for (int i = 0; i < t->to_free_sz; i++) {
             int spot = t->to_free[i];
             if (tm->to_free_n + 1 >= tm->to_free_sz) {
                 tm->to_free_sz = RESIZE_FACTOR * tm->to_free_sz;
@@ -330,8 +326,8 @@ bool tm_end(shared_t shared, tx_t tx) {
 
         if (tm->to_free_n >= FREE_BATCHSIZE) {
             pthread_rwlock_wrlock(&tm->cleanup_lock);
-            
-            for (int i=0; i<tm->to_free_n; i++) {
+
+            for (int i = 0; i < tm->to_free_n; i++) {
                 int spot = tm->to_free[i];
                 delete_segment(tm, spot);
             }
@@ -360,7 +356,7 @@ shared
  **/
 bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
     tm_t tm = shared;
-    transaction_t transaction = (void *) tx;
+    transaction_t transaction = (void *)tx;
 
     if (transaction->is_ro) {
         return ro_transaction_read(tm, transaction, source, size, target);
@@ -405,7 +401,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
             // abort
             transaction_cleanup(tm, transaction, true);
 
-//            printf("aborting transaction because of version number\n");
+            // printf("aborting transaction because of version number\n");
             return false;
         }
         memcpy(target + i * align, s->data + (start_word + i) * align, align);
@@ -427,7 +423,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
                 return false;
             }
         }
-        transaction->rs[transaction->rs_n++] = (rs_item_t) {version};
+        transaction->rs[transaction->rs_n++] = (rs_item_t){version};
     }
 
     return true;
@@ -467,9 +463,9 @@ private
  **/
 bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target) {
     tm_t tm = shared;
-    transaction_t transaction = (transaction_t) tx;
+    transaction_t transaction = (transaction_t)tx;
 
-//    printf("tm_write: %p %p %d", source, target, size);
+    //    printf("tm_write: %p %p %d", source, target, size);
 
     segment_t s = tm->va_arr[index_from_va(target)];
     int idx_start = offset_from_va(target) / tm->align;
@@ -505,7 +501,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
             transaction->ws = realloc(transaction->ws, transaction->ws_sz * sizeof(ws_item_t));
             if (transaction->ws == NULL) {
                 transaction_cleanup(tm, transaction, true);
-//                printf("aborting transaction because of malloc\n");
+                // printf("aborting transaction because of malloc\n");
                 return false;
             }
         }
@@ -516,10 +512,10 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
         }
         memcpy(tmp, source + i * tm->align, tm->align);
         void *raw_address = s->data + (idx_start + i) * tm->align;
-        transaction->ws[transaction->ws_n++] = (ws_item_t) {target + i * tm->align, tmp, raw_address, version_lock};
+        transaction->ws[transaction->ws_n++] = (ws_item_t){target + i * tm->align, tmp, raw_address, version_lock};
 
         // remove word from read-set
-        for (int i=0; i<transaction->rs_n; i++) {
+        for (int i = 0; i < transaction->rs_n; i++) {
             if (transaction->rs[i] == version_lock) {
                 transaction->rs[i] = NULL;
                 break;
@@ -540,7 +536,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
  **/
 alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
     tm_t tm = shared;
-    transaction_t unused(transaction) = (transaction_t) tx;
+    transaction_t unused(transaction) = (transaction_t)tx;
 
     // printf("tm_alloc called\n");
 
@@ -570,7 +566,6 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
         return nomem_alloc;
     }
 
-
     *target = va_from_index(spot, 0);
     // printf("Allocated semgment %d, va: %p\n", spot, *target);
 
@@ -585,13 +580,13 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
  * @return Whether the whole transaction can continue
  **/
 bool tm_free(shared_t unused(shared), tx_t tx, void *target) {
-    transaction_t transaction = (transaction_t) tx;
+    transaction_t transaction = (transaction_t)tx;
 
     int spot = index_from_va(target);
     // printf("tm_free called with spot=%d\n", spot);
 
     transaction->to_free = realloc(transaction->to_free, (++transaction->to_free_sz) * sizeof(int));
-    transaction->to_free[transaction->to_free_sz-1] = spot;
+    transaction->to_free[transaction->to_free_sz - 1] = spot;
 
     return true;
 }
