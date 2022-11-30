@@ -384,7 +384,6 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
             continue;
         }
 
-        // Read word the same way as for read-only transactions
         versioned_lock_t *version = &s->locks[start_word + i];
 
         // Check if word is present in the read set
@@ -501,7 +500,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
             transaction->ws = realloc(transaction->ws, transaction->ws_sz * sizeof(ws_item_t));
             if (transaction->ws == NULL) {
                 transaction_cleanup(tm, transaction, true);
-                // printf("aborting transaction because of malloc\n");
+                //                printf("aborting transaction because of malloc\n");
                 return false;
             }
         }
@@ -656,6 +655,7 @@ void tm_cleanup(tm_t tm) {
         free(tmp);
     }
     free(tm->va_arr);
+    free(tm->to_free);
     pthread_rwlock_destroy(&tm->cleanup_lock);
     pthread_mutex_destroy(&tm->virtual_memory_lock);
     free(tm);
