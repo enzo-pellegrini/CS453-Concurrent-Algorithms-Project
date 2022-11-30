@@ -656,6 +656,7 @@ void tm_cleanup(tm_t tm) {
         free(tmp);
     }
     free(tm->va_arr);
+    free(tm->to_free);
     pthread_rwlock_destroy(&tm->cleanup_lock);
     pthread_mutex_destroy(&tm->virtual_memory_lock);
     free(tm);
