@@ -264,7 +264,7 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
     }
 
     // sort the write-set
-    // qsort(t->ws, t->ws_n, sizeof(ws_item_t), ws_item_cmp);
+    qsort(t->ws, t->ws_n, sizeof(ws_item_t), ws_item_cmp);
 
     // try to lock each item in the write-set
     for (int i = 0; i < t->ws_n; i++) {
