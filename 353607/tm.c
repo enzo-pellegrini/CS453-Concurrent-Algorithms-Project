@@ -39,7 +39,7 @@
 #define VA_SIZE 65536
 #define VEC_INITIAL 8
 #define RESIZE_FACTOR 1.2
-#define FREE_BATCHSIZE 64
+#define FREE_BATCHSIZE 128
 
 /* *********************************** *
  * STRUCTURES FOR TRANSACTIONAL MEMORY *
@@ -258,6 +258,12 @@ bool tm_end(shared_t shared, tx_t tx) {
     if (t->is_ro) {
         pthread_rwlock_unlock(&tm->cleanup_lock);
         free(t);
+        return true;
+    }
+
+    if (t->ws_n == 0) {
+        pthread_rwlock_unlock(&tm->cleanup_lock);
+        transaction_cleanup(tm, t, false);
         return true;
     }
 
