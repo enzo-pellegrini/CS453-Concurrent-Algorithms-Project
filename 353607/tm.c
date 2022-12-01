@@ -1,16 +1,20 @@
 /**
  * @file   tm.c
- * @author [...]
+ * @author Vincenzo Pellegrini
  *
  * @section LICENSE
  *
  * [...]
+ * Copyright © 2022 Vincenzo Pellegrini dev@enzopellegrini.me
+ * This work is free. You can redistribute it and/or modify it under the
+ * terms of the Do What The Fuck You Want To Public License, Version 2,
+ * as published by Sam Hocevar. See the COPYING file for more details.
  *
  * @section DESCRIPTION
  *
- * Implementation of your own transaction manager.
- * You can completely rewrite this file (and create more files) as you wish.
- * Only the interface (i.e. exported symbols and semantic) must be preserved.
+ * Implementaion of STM based on TL2,
+ * with the addition of revalidation during reads in read-only transactions,
+ * to try and reduce the number of aborts in read-only transactions.
  **/
 
 // Requested features
@@ -32,9 +36,9 @@
 // Internal headers
 #include <tm.h>
 
+#include "bloom.h"
 #include "macros.h"
 #include "versioned_lock.h"
-#include "bloom.h"
 
 #define VA_SIZE 65536
 #define VEC_INITIAL 8
@@ -120,7 +124,7 @@ inline void segment_cleanup(segment_t segment);
 inline void tm_cleanup(tm_t tm);
 inline void transaction_cleanup(tm_t tm, transaction_t transaction, bool failed);
 
-bool add_to_readset(transaction_t transaction, versioned_lock_t* version);
+bool add_to_readset(transaction_t transaction, versioned_lock_t *version);
 bool revalidate_sets(transaction_t t);
 
 // Utility functions
@@ -374,7 +378,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
 
     for (int i = 0; i < num_words; i++) {
         bool found = false;
-        const void* curr = source + i * align;
+        const void *curr = source + i * align;
 
         // Check if word is present in the write set
         if (bf_in(transaction->ws_bloom, curr)) {
@@ -423,8 +427,8 @@ bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source,
 
     // pre validation
     int prev[num_words];
-    for (int i=0; i < num_words; i++) {
-        versioned_lock_t* lock = &s->locks[start_idx + i];
+    for (int i = 0; i < num_words; i++) {
+        versioned_lock_t *lock = &s->locks[start_idx + i];
         int version_read = vl_read_version(lock);
         if (version_read == -1) {
             transaction_cleanup(tm, transaction, true);
@@ -436,7 +440,7 @@ bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source,
     memcpy(target, s->data + offset, size);
     // post validation
     for (int i = 0; i < num_words; i++) {
-        versioned_lock_t* lock = &s->locks[start_idx + i];
+        versioned_lock_t *lock = &s->locks[start_idx + i];
         int version_read = vl_read_version(lock);
         if (version_read != prev[i]) {
             // word locked, abort
@@ -480,7 +484,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
 
     for (int i = 0; i < num_words; i++) {
         versioned_lock_t *version_lock = &s->locks[idx_start + i];
-        
+
         // Optional check
         int version_read = vl_read_version(version_lock);
         if (version_read == -1 || version_read > transaction->rv) {
@@ -489,7 +493,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
             return false;
         }
 
-        const void* curr = target + i * tm->align;
+        const void *curr = target + i * tm->align;
 
         // Check if word already in write set
         if (bf_in(transaction->ws_bloom, curr)) {
@@ -605,7 +609,7 @@ bool tm_free(shared_t unused(shared), tx_t tx, void *target) {
 
 // read-set / write-set functions
 
-bool add_to_readset(transaction_t t, versioned_lock_t* lock) {
+bool add_to_readset(transaction_t t, versioned_lock_t *lock) {
     assert(lock != NULL);
     if (!t->is_ro) {
         for (int i = 0; i < t->rs_n; i++) {
@@ -628,7 +632,7 @@ bool add_to_readset(transaction_t t, versioned_lock_t* lock) {
 
 bool revalidate_sets(transaction_t t) {
     assert(t->is_ro);
-    for (int i=0; i<t->rs_n; i++) {
+    for (int i = 0; i < t->rs_n; i++) {
         int version_read = vl_read_version(t->rs[i]);
         if (version_read == -1 || version_read > t->rv) {
             return false;
@@ -710,7 +714,7 @@ void transaction_cleanup(tm_t tm, transaction_t t, bool failed) {
     }
     free(t->rs);
     if (!t->is_ro) {
-        for (int i=0; i<t->ws_n; i++) {
+        for (int i = 0; i < t->ws_n; i++) {
             free(t->ws[i].value);
         }
         free(t->ws);
