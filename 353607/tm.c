@@ -419,7 +419,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
         }
 
         if (found_in_readset) {
-            return true;
+            continue;
         }
         // Add word to read set
         if (transaction->rs_n == transaction->rs_sz) {
