@@ -120,6 +120,9 @@ inline void segment_cleanup(segment_t segment);
 inline void tm_cleanup(tm_t tm);
 inline void transaction_cleanup(tm_t tm, transaction_t transaction, bool failed);
 
+bool add_to_readset(transaction_t transaction, versioned_lock_t* version);
+bool revalidate_sets(transaction_t t);
+
 // Utility functions
 void delete_segment(tm_t tm, int spot);
 
@@ -215,9 +218,6 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     }
     t->rv = atomic_load(&tm->global_version);
     t->is_ro = is_ro;
-    if (is_ro) {
-        return (tx_t)t; // I didn't actually need as much space as I allocated
-    }
 
     // Allocate read-set
     t->rs_sz = VEC_INITIAL;
@@ -226,6 +226,10 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
     if (t->rs == NULL) {
         free(t);
         return invalid_tx;
+    }
+
+    if (is_ro) {
+        return (tx_t)t; // I didn't actually need as much space as I allocated
     }
 
     // Allocate write-set
@@ -255,13 +259,7 @@ bool tm_end(shared_t shared, tx_t tx) {
     tm_t tm = (tm_t)shared;
     transaction_t t = (transaction_t)tx;
 
-    if (t->is_ro) {
-        pthread_rwlock_unlock(&tm->cleanup_lock);
-        free(t);
-        return true;
-    }
-
-    if (t->ws_n == 0) {
+    if (t->is_ro || t->ws_n == 0) {
         pthread_rwlock_unlock(&tm->cleanup_lock);
         transaction_cleanup(tm, t, false);
         return true;
@@ -394,15 +392,6 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
 
         versioned_lock_t *version = &s->locks[start_word + i];
 
-        // Check if word is present in the read set
-        bool found_in_readset = false;
-        for (int j = 0; j < transaction->rs_n; j++) {
-            if (transaction->rs[j] == version) {
-                found_in_readset = true;
-                break;
-            }
-        }
-
         int version_read = vl_read_version(version);
         if (version_read == -1 || version_read > transaction->rv) {
             // abort
@@ -418,19 +407,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
             return false;
         }
 
-        if (found_in_readset) {
-            return true;
-        }
-        // Add word to read set
-        if (transaction->rs_n == transaction->rs_sz) {
-            transaction->rs_sz *= RESIZE_FACTOR;
-            transaction->rs = realloc(transaction->rs, transaction->rs_sz * sizeof(rs_item_t));
-            if (transaction->rs == NULL) {
-                transaction_cleanup(tm, transaction, true);
-                return false;
-            }
-        }
-        transaction->rs[transaction->rs_n++] = (rs_item_t){version};
+        add_to_readset(transaction, version);
     }
 
     return true;
@@ -444,11 +421,37 @@ bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source,
 
     assert(num_words > 0 && offset + size <= s->size); // sanity check
 
+    // pre validation
+    int prev[num_words];
+    for (int i=0; i < num_words; i++) {
+        versioned_lock_t* lock = &s->locks[start_idx + i];
+        int version_read = vl_read_version(lock);
+        if (version_read == -1) {
+            transaction_cleanup(tm, transaction, true);
+            return false;
+        }
+        prev[i] = version_read;
+    }
+    // read
     memcpy(target, s->data + offset, size);
+    // post validation
     for (int i = 0; i < num_words; i++) {
-        int versionRead = vl_read_version(&s->locks[start_idx + i]);
-        if (versionRead == -1 || versionRead > transaction->rv) {
+        versioned_lock_t* lock = &s->locks[start_idx + i];
+        int version_read = vl_read_version(lock);
+        if (version_read != prev[i]) {
             // word locked, abort
+            transaction_cleanup(tm, transaction, true);
+            return false;
+        } else if (version_read > transaction->rv) {
+            int next_rv = atomic_load(&tm->global_version);
+            if (!revalidate_sets(transaction)) {
+                transaction_cleanup(tm, transaction, true);
+                return false;
+            }
+            // printf("Revalidation succesful!%d\n", i);
+            transaction->rv = next_rv;
+        }
+        if (!add_to_readset(transaction, lock)) {
             transaction_cleanup(tm, transaction, true);
             return false;
         }
@@ -600,6 +603,40 @@ bool tm_free(shared_t unused(shared), tx_t tx, void *target) {
  * IMPLEMENTATION OF INTERNAL FUNCTIONS *
  * ************************************ */
 
+// read-set / write-set functions
+
+bool add_to_readset(transaction_t t, versioned_lock_t* lock) {
+    assert(lock != NULL);
+    if (!t->is_ro) {
+        for (int i = 0; i < t->rs_n; i++) {
+            if (t->rs[i] == lock) {
+                return true;
+            }
+        }
+    }
+    // Add word to read set
+    if (t->rs_n >= t->rs_sz) {
+        t->rs_sz *= RESIZE_FACTOR;
+        t->rs = realloc(t->rs, t->rs_sz * sizeof(rs_item_t));
+        if (t->rs == NULL) {
+            return false;
+        }
+    }
+    t->rs[t->rs_n++] = (rs_item_t){lock};
+    return true;
+}
+
+bool revalidate_sets(transaction_t t) {
+    assert(t->is_ro);
+    for (int i=0; i<t->rs_n; i++) {
+        int version_read = vl_read_version(t->rs[i]);
+        if (version_read == -1 || version_read > t->rv) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Utility functions
 
 void delete_segment(tm_t tm, int spot) {
@@ -671,12 +708,12 @@ void transaction_cleanup(tm_t tm, transaction_t t, bool failed) {
     if (failed) {
         pthread_rwlock_unlock(&tm->cleanup_lock);
     }
+    free(t->rs);
     if (!t->is_ro) {
         for (int i=0; i<t->ws_n; i++) {
             free(t->ws[i].value);
         }
         free(t->ws);
-        free(t->rs);
         free(t->to_free);
     }
     free(t);
