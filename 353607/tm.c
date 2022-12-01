@@ -34,11 +34,12 @@
 
 #include "macros.h"
 #include "versioned_lock.h"
+#include "bloom.h"
 
 #define VA_SIZE 65536
 #define VEC_INITIAL 8
 #define RESIZE_FACTOR 1.2
-#define FREE_BATCHSIZE 64
+#define FREE_BATCHSIZE 128
 
 /* *********************************** *
  * STRUCTURES FOR TRANSACTIONAL MEMORY *
@@ -101,6 +102,7 @@ typedef struct tx_s {
     ws_item_t *ws;
     int ws_sz;
     int ws_n;
+    bf_t ws_bloom;
     rs_item_t *rs;
     int rs_sz;
     int rs_n;
@@ -235,6 +237,7 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
         free(t);
         return invalid_tx;
     }
+    bf_init(&t->ws_bloom, tm->align);
 
     // Init to-free array
     t->to_free_sz = 0;
@@ -255,6 +258,12 @@ bool tm_end(shared_t shared, tx_t tx) {
     if (t->is_ro) {
         pthread_rwlock_unlock(&tm->cleanup_lock);
         free(t);
+        return true;
+    }
+
+    if (t->ws_n == 0) {
+        pthread_rwlock_unlock(&tm->cleanup_lock);
+        transaction_cleanup(tm, t, false);
         return true;
     }
 
@@ -300,8 +309,7 @@ bool tm_end(shared_t shared, tx_t tx) {
         }
     }
 
-    // for each item in write set, write to memory, set version number to wv and
-    // unlock
+    // for each item in write set, write to memory, set version number to wv and unlock
     for (int i = 0; i < t->ws_n; i++) {
         ws_item_t item = t->ws[i];
         memcpy(item.raw_addr, item.value, tm->align);
@@ -309,6 +317,8 @@ bool tm_end(shared_t shared, tx_t tx) {
     }
 
     pthread_rwlock_unlock(&tm->cleanup_lock);
+
+    // printf("Commited transaction with %d reads %d writes %d frees\n", t->rs_n, t->ws_n, t->to_free_sz);
 
     if (t->to_free_sz > 0) {
         pthread_mutex_lock(&tm->to_free_lock);
@@ -366,17 +376,20 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
 
     for (int i = 0; i < num_words; i++) {
         bool found = false;
+        const void* curr = source + i * align;
 
         // Check if word is present in the write set
-        for (int j = 0; j < transaction->ws_n; j++) {
-            if (transaction->ws[j].addr == source + i * align) {
-                memcpy(target, transaction->ws[j].value, align);
-                found = true;
-                break;
+        if (bf_in(transaction->ws_bloom, curr)) {
+            for (int j = 0; j < transaction->ws_n; j++) {
+                if (transaction->ws[j].addr == curr) {
+                    memcpy(target, transaction->ws[j].value, align);
+                    found = true;
+                    break;
+                }
             }
-        }
-        if (found) {
-            continue;
+            if (found) {
+                continue;
+            }
         }
 
         versioned_lock_t *version = &s->locks[start_word + i];
@@ -473,18 +486,21 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
             return false;
         }
 
-        // Check if word already in write set
-        bool found = false;
-        for (int j = 0; j < transaction->ws_n; j++) {
-            if (transaction->ws[j].addr == target + i * tm->align) {
-                found = true;
-                memcpy(transaction->ws[j].value, source + i * tm->align, tm->align);
-                break;
-            }
-        }
+        const void* curr = target + i * tm->align;
 
-        if (found) {
-            continue;
+        // Check if word already in write set
+        if (bf_in(transaction->ws_bloom, curr)) {
+            bool found = false;
+            for (int j = 0; j < transaction->ws_n; j++) {
+                if (transaction->ws[j].addr == curr) {
+                    found = true;
+                    memcpy(transaction->ws[j].value, source + i * tm->align, tm->align);
+                    break;
+                }
+            }
+            if (found) {
+                continue;
+            }
         }
 
         // Add word to write set
@@ -505,6 +521,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
         memcpy(tmp, source + i * tm->align, tm->align);
         void *raw_address = s->data + (idx_start + i) * tm->align;
         transaction->ws[transaction->ws_n++] = (ws_item_t){target + i * tm->align, tmp, raw_address, version_lock};
+        bf_add(&transaction->ws_bloom, curr);
 
         // remove word from read-set
         for (int i = 0; i < transaction->rs_n; i++) {
