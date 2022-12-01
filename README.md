@@ -1,4 +1,10 @@
-# CS-453 - Course project
+# CS-453 EPFL - Concurrent Algorithms course project
+
+My implementation of a Software Transactional Memory based on TL2, with the addition of revalidation during reads in read-only transactions, to try and reduce the number of aborts in read-only transactions.
+My code is [here](353607).
+
+
+## Assigment
 
 The [project description](https://dcl.epfl.ch/site/_media/education/ca-project.pdf) is available on [Moodle](https://moodle.epfl.ch/course/view.php?id=14334) and the [website of the course](https://dcl.epfl.ch/site/education/ca_2021).
 
