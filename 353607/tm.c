@@ -394,14 +394,6 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
 
         versioned_lock_t *version = &s->locks[start_word + i];
 
-        // Check if word is present in the read set
-        bool found_in_readset = false;
-        for (int j = 0; j < transaction->rs_n; j++) {
-            if (transaction->rs[j] == version) {
-                found_in_readset = true;
-                break;
-            }
-        }
 
         int version_read = vl_read_version(version);
         if (version_read == -1 || version_read > transaction->rv) {
@@ -418,6 +410,14 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
             return false;
         }
 
+        // Check if word is present in the read set
+        bool found_in_readset = false;
+        for (int j = 0; j < transaction->rs_n; j++) {
+            if (transaction->rs[j] == version) {
+                found_in_readset = true;
+                break;
+            }
+        }
         if (found_in_readset) {
             continue;
         }
