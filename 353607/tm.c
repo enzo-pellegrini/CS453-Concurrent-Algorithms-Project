@@ -643,7 +643,10 @@ bool revalidate_sets(transaction_t t) {
 // Utility functions
 
 void delete_segment(tm_t tm, int spot) {
-    segment_cleanup(tm->va_arr[spot]);
+    segment_t seg = tm->va_arr[spot];
+    if (seg != NULL) {
+        segment_cleanup(seg);
+    }
     tm->va_arr[spot] = NULL;
 
     empty_spot_t tmp = malloc(sizeof(struct empty_spot_s));
