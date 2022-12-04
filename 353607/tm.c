@@ -17,6 +17,7 @@
  **/
 
 // Requested features
+#include <sys/_pthread/_pthread_mutex_t.h>
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #ifdef __STDC_NO_ATOMICS__
@@ -704,6 +705,7 @@ void tm_cleanup(tm_t tm) {
     free(tm->to_free);
     pthread_rwlock_destroy(&tm->cleanup_lock);
     pthread_mutex_destroy(&tm->virtual_memory_lock);
+    pthread_mutex_destroy(&tm->to_free_lock);
     free(tm);
 }
 
