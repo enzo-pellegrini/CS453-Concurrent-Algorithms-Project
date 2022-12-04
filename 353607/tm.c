@@ -556,7 +556,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target) {
 
     pthread_mutex_lock(&tm->virtual_memory_lock);
 
-    int spot = tm->va_n++;
+    int spot;
     if (tm->empty_spots != NULL) {
         spot = tm->empty_spots->index;
         empty_spot_t tmp = tm->empty_spots;
