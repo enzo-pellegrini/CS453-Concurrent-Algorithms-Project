@@ -17,7 +17,6 @@
  **/
 
 // Requested features
-#include <sys/_pthread/_pthread_mutex_t.h>
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #ifdef __STDC_NO_ATOMICS__
