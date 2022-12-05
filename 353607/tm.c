@@ -317,10 +317,7 @@ bool tm_end(shared_t shared, tx_t tx) {
         vl_unlock_update(item.versioned_lock, wv);
     }
 
-    pthread_rwlock_unlock(&tm->cleanup_lock);
-
-    // printf("Commited transaction with %d reads %d writes %d frees\n", t->rs_n, t->ws_n, t->to_free_sz);
-
+    // Add segments to free to tm->to_free
     if (t->to_free_sz > 0) {
         pthread_mutex_lock(&tm->to_free_lock);
 
@@ -333,19 +330,23 @@ bool tm_end(shared_t shared, tx_t tx) {
             tm->to_free[tm->to_free_n++] = spot;
         }
 
-        if (tm->to_free_n >= FREE_BATCHSIZE) {
-            pthread_rwlock_wrlock(&tm->cleanup_lock);
-
-            for (int i = 0; i < tm->to_free_n; i++) {
-                int spot = tm->to_free[i];
-                delete_segment(tm, spot);
-            }
-            tm->to_free_n = 0;
-
-            pthread_rwlock_unlock(&tm->cleanup_lock);
-        }
-
         pthread_mutex_unlock(&tm->to_free_lock);
+    }
+
+    pthread_rwlock_unlock(&tm->cleanup_lock);
+
+    // printf("Commited transaction with %d reads %d writes %d frees\n", t->rs_n, t->ws_n, t->to_free_sz);
+
+    if (tm->to_free_n >= FREE_BATCHSIZE) {
+        pthread_rwlock_wrlock(&tm->cleanup_lock);
+
+        for (int i = 0; i < tm->to_free_n; i++) {
+            int spot = tm->to_free[i];
+            delete_segment(tm, spot);
+        }
+        tm->to_free_n = 0;
+
+        pthread_rwlock_unlock(&tm->cleanup_lock);
     }
 
     transaction_cleanup(tm, t, false);
@@ -383,7 +384,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
         if (bf_in(transaction->ws_bloom, curr)) {
             for (int j = 0; j < transaction->ws_n; j++) {
                 if (transaction->ws[j].addr == curr) {
-                    memcpy(target, transaction->ws[j].value, align);
+                    memcpy(target + i * align, transaction->ws[j].value, align);
                     found = true;
                     break;
                 }
@@ -596,6 +597,11 @@ bool tm_free(shared_t unused(shared), tx_t tx, void *target) {
     int spot = index_from_va(target);
     // printf("tm_free called with spot=%d\n", spot);
 
+    if (spot == 0) {
+        transaction_cleanup((tm_t)shared, transaction, true);
+        return false;
+    }
+
     transaction->to_free = realloc(transaction->to_free, (++transaction->to_free_sz) * sizeof(int));
     transaction->to_free[transaction->to_free_sz - 1] = spot;
 
@@ -644,9 +650,10 @@ bool revalidate_sets(transaction_t t) {
 
 void delete_segment(tm_t tm, int spot) {
     segment_t seg = tm->va_arr[spot];
-    if (seg != NULL) {
-        segment_cleanup(seg);
-    }
+    if (seg == NULL)
+        return;
+
+    segment_cleanup(seg);
     tm->va_arr[spot] = NULL;
 
     empty_spot_t tmp = malloc(sizeof(struct empty_spot_s));
