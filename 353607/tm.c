@@ -88,7 +88,11 @@ typedef struct shared_s {
  * STRUCTURES FOR TRANSACTION *
  * ************************** */
 
-typedef versioned_lock_t *rs_item_t;
+// typedef versioned_lock_t *rs_item_t;
+typedef struct rs_item_s {
+    int version_read;
+    versioned_lock_t *versioned_lock;
+} rs_item_t;
 
 typedef struct ws_item_s {
     void *addr;  // virtual address
@@ -123,7 +127,7 @@ inline void segment_cleanup(segment_t segment);
 inline void tm_cleanup(tm_t tm);
 inline void transaction_cleanup(tm_t tm, transaction_t transaction, bool failed);
 
-bool add_to_readset(transaction_t transaction, versioned_lock_t *version);
+bool add_to_readset(transaction_t transaction, versioned_lock_t *version, int version_read);
 bool revalidate_sets(transaction_t t);
 
 // Utility functions
@@ -294,9 +298,9 @@ bool tm_end(shared_t shared, tx_t tx) {
     if (t->rv + 1 != wv) {
         // check version number and if it is locked for each item in read-set,
         for (int i = 0; i < t->rs_n; i++) {
-            if (t->rs[i] == NULL)
+            if (t->rs[i].versioned_lock == NULL)
                 continue;
-            int version_read = vl_read_version(t->rs[i]);
+            int version_read = vl_read_version(t->rs[i].versioned_lock);
             if (version_read == -1 || version_read > t->rv) {
                 // abort, unlock all locks
                 for (int j = 0; j < t->ws_n; j++) {
@@ -411,7 +415,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
             return false;
         }
 
-        add_to_readset(transaction, version);
+        add_to_readset(transaction, version, version_read);
     }
 
     return true;
@@ -455,7 +459,7 @@ bool ro_transaction_read(tm_t tm, transaction_t transaction, void const *source,
             // printf("Revalidation succesful!%d\n", i);
             transaction->rv = next_rv;
         }
-        if (!add_to_readset(transaction, lock)) {
+        if (!add_to_readset(transaction, lock, version_read)) {
             transaction_cleanup(tm, transaction, true);
             return false;
         }
@@ -532,8 +536,8 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
 
         // remove word from read-set
         for (int i = 0; i < transaction->rs_n; i++) {
-            if (transaction->rs[i] == version_lock) {
-                transaction->rs[i] = NULL;
+            if (transaction->rs[i].versioned_lock == version_lock) {
+                transaction->rs[i].versioned_lock = NULL;
                 break;
             }
         }
@@ -614,11 +618,11 @@ bool tm_free(shared_t unused(shared), tx_t tx, void *target) {
 
 // read-set / write-set functions
 
-bool add_to_readset(transaction_t t, versioned_lock_t *lock) {
+bool add_to_readset(transaction_t t, versioned_lock_t *lock, int version_read) {
     assert(lock != NULL);
     if (!t->is_ro) {
         for (int i = 0; i < t->rs_n; i++) {
-            if (t->rs[i] == lock) {
+            if (t->rs[i].versioned_lock == lock) {
                 return true;
             }
         }
@@ -631,15 +635,15 @@ bool add_to_readset(transaction_t t, versioned_lock_t *lock) {
             return false;
         }
     }
-    t->rs[t->rs_n++] = (rs_item_t){lock};
+    t->rs[t->rs_n++] = (rs_item_t){version_read, lock};
     return true;
 }
 
 bool revalidate_sets(transaction_t t) {
     assert(t->is_ro);
     for (int i = 0; i < t->rs_n; i++) {
-        int version_read = vl_read_version(t->rs[i]);
-        if (version_read == -1 || version_read > t->rv) {
+        int version_read = vl_read_version(t->rs[i].versioned_lock);
+        if (version_read != t->rs[i].version_read) {
             return false;
         }
     }
