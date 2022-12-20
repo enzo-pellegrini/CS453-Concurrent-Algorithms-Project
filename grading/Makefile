@@ -19,8 +19,8 @@ OBJS     := $(SRCS_C:%=%.o) $(SRCS_CXX:%=%.o)
 CC       := $(CC)
 CCFLAGS  := -Wall -Wextra -Wfatal-errors -O2 -std=c11 $(foreach INCLUDE_DIR,$(INCLUDE_DIRS),-I$(INCLUDE_DIR))
 CXX      := $(CXX)
-CXXFLAGS := -Wall -Wextra -Wfatal-errors -O2 -std=c++17 $(foreach INCLUDE_DIR,$(INCLUDE_DIRS),-I$(INCLUDE_DIR))
-# CXXFLAGS := -Wall -Wextra -Wfatal-errors -std=c++17 $(foreach INCLUDE_DIR,$(INCLUDE_DIRS),-I$(INCLUDE_DIR)) -g
+# CXXFLAGS := -Wall -Wextra -Wfatal-errors -O2 -std=c++17 $(foreach INCLUDE_DIR,$(INCLUDE_DIRS),-I$(INCLUDE_DIR))
+CXXFLAGS := -Wall -Wextra -Wfatal-errors -std=c++17 $(foreach INCLUDE_DIR,$(INCLUDE_DIRS),-I$(INCLUDE_DIR)) -g
 LD       := $(if $(SRCS_CXX),$(CXX),$(CC))
 LDFLAGS  :=
 LDLIBS   := -ldl -lpthread
